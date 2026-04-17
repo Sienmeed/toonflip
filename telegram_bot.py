@@ -731,19 +731,26 @@ async def callback_translate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             # Auto-push new glossary entries to sheet
             auto_push_note = ""
-            if SHEETS_AVAILABLE and gloss_section and data.get("sheet_id") and data.get("current_title"):
-                creds_path = os.path.join(DATA_DIR, "credentials.json")
-                if os.path.exists(creds_path):
-                    try:
-                        count = push_glossary_to_sheet(
-                            data["sheet_id"], data["current_title"], glossary,
-                            creds_path, data.get("sheet_name")
-                        )
-                        if count > 0:
-                            auto_push_note = f"\n\n[Sheet] บันทึก {count} คำใหม่ → {data['current_title']}"
-                    except Exception as push_err:
-                        logger.error(f"Auto-push error: {push_err}")
-                        auto_push_note = f"\n\n[Sheet] Push ล้มเหลว: {push_err}"
+            if SHEETS_AVAILABLE and gloss_section:
+                if not data.get("sheet_id"):
+                    auto_push_note = "\n\n[Sheet] ยังไม่ได้ตั้งค่า sheet → /setsheet <URL>"
+                elif not data.get("current_title"):
+                    auto_push_note = "\n\n[Sheet] ยังไม่ได้เลือกชื่อเรื่อง → /addtitle แล้วกดเลือกในเมนู"
+                else:
+                    creds_path = os.path.join(DATA_DIR, "credentials.json")
+                    if not os.path.exists(creds_path):
+                        auto_push_note = "\n\n[Sheet] ไม่พบ credentials.json → ตั้ง env var GOOGLE_CREDENTIALS_JSON"
+                    else:
+                        try:
+                            count = push_glossary_to_sheet(
+                                data["sheet_id"], data["current_title"], glossary,
+                                creds_path, data.get("sheet_name")
+                            )
+                            if count > 0:
+                                auto_push_note = f"\n\n[Sheet] บันทึก {count} คำใหม่ → {data['current_title']}"
+                        except Exception as push_err:
+                            logger.error(f"Auto-push error: {push_err}")
+                            auto_push_note = f"\n\n[Sheet] Push ล้มเหลว: {push_err}"
 
             response += auto_push_note
 
@@ -910,19 +917,26 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         # Auto-push new glossary entries to sheet
         auto_push_note = ""
-        if SHEETS_AVAILABLE and glossary and data.get("sheet_id") and data.get("current_title"):
-            creds_path = os.path.join(DATA_DIR, "credentials.json")
-            if os.path.exists(creds_path):
-                try:
-                    count = push_glossary_to_sheet(
-                        data["sheet_id"], data["current_title"], glossary,
-                        creds_path, data.get("sheet_name")
-                    )
-                    if count > 0:
-                        auto_push_note = f"\n[Sheet] บันทึก {count} คำใหม่ → {data['current_title']}"
-                except Exception as push_err:
-                    logger.error(f"Auto-push error: {push_err}")
-                    auto_push_note = f"\n[Sheet] Push ล้มเหลว: {push_err}"
+        if SHEETS_AVAILABLE and glossary:
+            if not data.get("sheet_id"):
+                auto_push_note = "\n[Sheet] ยังไม่ได้ตั้งค่า sheet → /setsheet <URL>"
+            elif not data.get("current_title"):
+                auto_push_note = "\n[Sheet] ยังไม่ได้เลือกชื่อเรื่อง → /addtitle แล้วกดเลือกในเมนู"
+            else:
+                creds_path = os.path.join(DATA_DIR, "credentials.json")
+                if not os.path.exists(creds_path):
+                    auto_push_note = "\n[Sheet] ไม่พบ credentials.json → ตั้ง env var GOOGLE_CREDENTIALS_JSON"
+                else:
+                    try:
+                        count = push_glossary_to_sheet(
+                            data["sheet_id"], data["current_title"], glossary,
+                            creds_path, data.get("sheet_name")
+                        )
+                        if count > 0:
+                            auto_push_note = f"\n[Sheet] บันทึก {count} คำใหม่ → {data['current_title']}"
+                    except Exception as push_err:
+                        logger.error(f"Auto-push error: {push_err}")
+                        auto_push_note = f"\n[Sheet] Push ล้มเหลว: {push_err}"
 
         combined = "\n\n".join(all_pages)
         if glossary:
