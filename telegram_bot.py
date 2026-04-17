@@ -105,6 +105,8 @@ def load_user(user_id):
         "genre": "ไม่ระบุ (ทั่วไป)",
         "current_profile": None,
         "profiles": {},
+        "titles": [],
+        "current_title": None,
     }
 
 def save_user(user_id, data):
@@ -149,6 +151,38 @@ def format_glossary_context(glossary):
     for o, d in glossary.items():
         lines.append(f"- ชื่อต้นฉบับ: {o}, ชื่อแปล: {d['translated']}, คำอธิบาย: {d['description']}")
     return "\n".join(lines)
+
+
+def _settings_text(data):
+    model = data.get("model", DEFAULT_MODEL)
+    genre = data.get("genre", "ไม่ระบุ (ทั่วไป)")
+    prof = data.get("current_profile") or "None"
+    gloss = get_glossary(data)
+    lines = [
+        f"Model: {model}",
+        f"Genre: {genre}",
+        f"Profile: {prof}",
+        f"Glossary: {len(gloss)} entries",
+    ]
+    if data.get("titles"):
+        title = data.get("current_title") or "ยังไม่เลือก"
+        lines.append(f"เรื่อง: {title}")
+    lines.append("\nแก้ settings หรือกด Translate เลย")
+    return "\n".join(lines)
+
+
+def _settings_buttons(data):
+    rows = [
+        [InlineKeyboardButton("Translate", callback_data="tr:go")],
+        [
+            InlineKeyboardButton("Model", callback_data="tr:model"),
+            InlineKeyboardButton("Genre", callback_data="tr:genre"),
+        ],
+    ]
+    if data.get("titles"):
+        title = data.get("current_title") or "เลือกชื่อเรื่อง..."
+        rows.append([InlineKeyboardButton(f"📖 {title}", callback_data="tr:title")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ============================================================
@@ -216,11 +250,17 @@ HELP_TEXT = """*Manhwa Translator Bot*
 /sync - ดึง glossary จาก Sheet
 /pushsheet - ส่ง glossary ไป Sheet
 
+*ชื่อเรื่อง (สำหรับบันทึก Sheet):*
+/addtitle `<ชื่อ>` - เพิ่มชื่อเรื่อง
+/titles - ดูและเลือกชื่อเรื่อง
+/deltitle `<ชื่อ>` - ลบชื่อเรื่อง
+
 *วิธีใช้:*
 1. /setkey ตั้ง API Key
 2. /newprofile สร้าง profile
 3. /setgenre เลือกแนว
-4. ส่งรูปมังงะ\!"""
+4. /addtitle เพิ่มชื่อเรื่อง
+5. ส่งรูปมังงะ → เลือกชื่อเรื่อง → แปล → บันทึก Sheet อัตโนมัติ\!"""
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -521,6 +561,89 @@ async def cmd_setsheetname(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# TITLE MANAGEMENT
+# ============================================================
+async def cmd_addtitle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text("Usage: /addtitle <ชื่อเรื่อง>")
+        return
+    name = " ".join(ctx.args)
+    data = load_user(uid)
+    titles = data.get("titles", [])
+    if name in titles:
+        await update.message.reply_text(f"'{name}' มีอยู่แล้ว")
+        return
+    titles.append(name)
+    data["titles"] = titles
+    if not data.get("current_title"):
+        data["current_title"] = name
+    save_user(uid, data)
+    await update.message.reply_text(f"เพิ่ม '{name}' แล้ว ({len(titles)} เรื่อง)")
+
+
+async def cmd_titles(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    data = load_user(uid)
+    titles = data.get("titles", [])
+    current = data.get("current_title")
+    if not titles:
+        await update.message.reply_text("ยังไม่มีชื่อเรื่อง\nเพิ่มด้วย: /addtitle <ชื่อเรื่อง>")
+        return
+    buttons = []
+    for i, t in enumerate(titles):
+        mark = " ◀" if t == current else ""
+        buttons.append([InlineKeyboardButton(f"{t}{mark}", callback_data=f"tts:{i}")])
+    await update.message.reply_text(
+        f"ชื่อเรื่องทั้งหมด ({len(titles)}) — กดเพื่อเลือก:\nลบด้วย /deltitle <ชื่อ>",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def cmd_deltitle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text("Usage: /deltitle <ชื่อเรื่อง>")
+        return
+    name = " ".join(ctx.args)
+    data = load_user(uid)
+    titles = data.get("titles", [])
+    if name not in titles:
+        await update.message.reply_text(f"ไม่พบ '{name}'")
+        return
+    titles.remove(name)
+    data["titles"] = titles
+    if data.get("current_title") == name:
+        data["current_title"] = titles[0] if titles else None
+    save_user(uid, data)
+    await update.message.reply_text(f"ลบ '{name}' แล้ว")
+
+
+async def callback_tts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Select title from /titles list."""
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    idx = int(query.data[4:])
+    data = load_user(uid)
+    titles = data.get("titles", [])
+    if idx >= len(titles):
+        await query.edit_message_text("ไม่พบชื่อเรื่อง")
+        return
+    data["current_title"] = titles[idx]
+    save_user(uid, data)
+    current = titles[idx]
+    buttons = []
+    for i, t in enumerate(titles):
+        mark = " ◀" if t == current else ""
+        buttons.append([InlineKeyboardButton(f"{t}{mark}", callback_data=f"tts:{i}")])
+    await query.edit_message_text(
+        f"เลือก: {current}\nชื่อเรื่องทั้งหมด ({len(titles)}) — กดเพื่อเลือก:\nลบด้วย /deltitle <ชื่อ>",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+# ============================================================
 # IMAGE HANDLER - Show settings before translating
 # ============================================================
 # Store pending images per user
@@ -560,29 +683,7 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     _pending_images[uid] = img_data
 
-    # Show current settings with buttons
-    model = data.get("model", DEFAULT_MODEL)
-    genre = data.get("genre", "ไม่ระบุ (ทั่วไป)")
-    prof = data.get("current_profile", "None")
-    gloss = get_glossary(data)
-
-    text = (
-        f"Model: {model}\n"
-        f"Genre: {genre}\n"
-        f"Profile: {prof}\n"
-        f"Glossary: {len(gloss)} entries\n"
-        f"\nแก้ settings หรือกด Translate เลย"
-    )
-
-    buttons = [
-        [InlineKeyboardButton("Translate", callback_data="tr:go")],
-        [
-            InlineKeyboardButton("Model", callback_data="tr:model"),
-            InlineKeyboardButton("Genre", callback_data="tr:genre"),
-        ],
-    ]
-    kb = InlineKeyboardMarkup(buttons)
-    await update.message.reply_text(text, reply_markup=kb)
+    await update.message.reply_text(_settings_text(data), reply_markup=_settings_buttons(data))
 
 
 async def callback_translate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -594,7 +695,6 @@ async def callback_translate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     action = query.data[3:]  # remove "tr:" prefix
 
     if action == "go":
-        # Start translating
         img_data = _pending_images.pop(uid, None)
         if not img_data:
             await query.edit_message_text("No image pending. Send a new image.")
@@ -629,6 +729,24 @@ async def callback_translate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 for orig, info in glossary.items():
                     response += f"\n- {orig} -> {info['translated']}: {info['description']}"
 
+            # Auto-push new glossary entries to sheet
+            auto_push_note = ""
+            if SHEETS_AVAILABLE and gloss_section and data.get("sheet_id") and data.get("current_title"):
+                creds_path = os.path.join(DATA_DIR, "credentials.json")
+                if os.path.exists(creds_path):
+                    try:
+                        count = push_glossary_to_sheet(
+                            data["sheet_id"], data["current_title"], glossary,
+                            creds_path, data.get("sheet_name")
+                        )
+                        if count > 0:
+                            auto_push_note = f"\n\n[Sheet] บันทึก {count} คำใหม่ → {data['current_title']}"
+                    except Exception as push_err:
+                        logger.error(f"Auto-push error: {push_err}")
+                        auto_push_note = f"\n\n[Sheet] Push ล้มเหลว: {push_err}"
+
+            response += auto_push_note
+
             if len(response) <= 4096:
                 await msg.edit_text(response)
             else:
@@ -660,27 +778,21 @@ async def callback_translate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         buttons.append([InlineKeyboardButton("<< Back", callback_data="tr:back")])
         await query.edit_message_text("Select genre:", reply_markup=InlineKeyboardMarkup(buttons))
 
+    elif action == "title":
+        titles = data.get("titles", [])
+        if not titles:
+            await query.answer("ไม่มีชื่อเรื่อง กรุณาใช้ /addtitle ก่อน", show_alert=True)
+            return
+        current = data.get("current_title")
+        buttons = []
+        for i, t in enumerate(titles):
+            mark = " ◀" if t == current else ""
+            buttons.append([InlineKeyboardButton(f"{t}{mark}", callback_data=f"trt:{i}")])
+        buttons.append([InlineKeyboardButton("<< Back", callback_data="tr:back")])
+        await query.edit_message_text("เลือกชื่อเรื่องที่จะแปล:", reply_markup=InlineKeyboardMarkup(buttons))
+
     elif action == "back":
-        # Back to main settings view
-        model = data.get("model", DEFAULT_MODEL)
-        genre = data.get("genre", "ไม่ระบุ (ทั่วไป)")
-        prof = data.get("current_profile", "None")
-        gloss = get_glossary(data)
-        text = (
-            f"Model: {model}\n"
-            f"Genre: {genre}\n"
-            f"Profile: {prof}\n"
-            f"Glossary: {len(gloss)} entries\n"
-            f"\nแก้ settings หรือกด Translate เลย"
-        )
-        buttons = [
-            [InlineKeyboardButton("Translate", callback_data="tr:go")],
-            [
-                InlineKeyboardButton("Model", callback_data="tr:model"),
-                InlineKeyboardButton("Genre", callback_data="tr:genre"),
-            ],
-        ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text(_settings_text(data), reply_markup=_settings_buttons(data))
 
 
 async def callback_trmodel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -692,25 +804,7 @@ async def callback_trmodel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = load_user(uid)
     data["model"] = model_name
     save_user(uid, data)
-    # Go back to settings view
-    genre = data.get("genre", "ไม่ระบุ (ทั่วไป)")
-    prof = data.get("current_profile", "None")
-    gloss = get_glossary(data)
-    text = (
-        f"Model: {model_name}\n"
-        f"Genre: {genre}\n"
-        f"Profile: {prof}\n"
-        f"Glossary: {len(gloss)} entries\n"
-        f"\nแก้ settings หรือกด Translate เลย"
-    )
-    buttons = [
-        [InlineKeyboardButton("Translate", callback_data="tr:go")],
-        [
-            InlineKeyboardButton("Model", callback_data="tr:model"),
-            InlineKeyboardButton("Genre", callback_data="tr:genre"),
-        ],
-    ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    await query.edit_message_text(_settings_text(data), reply_markup=_settings_buttons(data))
 
 
 async def callback_trgenre(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -725,24 +819,21 @@ async def callback_trgenre(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if prof and prof in data.get("profiles", {}):
         data["profiles"][prof]["genre"] = GENRE_LIST[idx]
     save_user(uid, data)
-    # Go back to settings view
-    model = data.get("model", DEFAULT_MODEL)
-    gloss = get_glossary(data)
-    text = (
-        f"Model: {model}\n"
-        f"Genre: {GENRE_LIST[idx]}\n"
-        f"Profile: {prof or 'None'}\n"
-        f"Glossary: {len(gloss)} entries\n"
-        f"\nแก้ settings หรือกด Translate เลย"
-    )
-    buttons = [
-        [InlineKeyboardButton("Translate", callback_data="tr:go")],
-        [
-            InlineKeyboardButton("Model", callback_data="tr:model"),
-            InlineKeyboardButton("Genre", callback_data="tr:genre"),
-        ],
-    ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    await query.edit_message_text(_settings_text(data), reply_markup=_settings_buttons(data))
+
+
+async def callback_trtitle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle title selection during translate flow."""
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    idx = int(query.data[4:])  # remove "trt:"
+    data = load_user(uid)
+    titles = data.get("titles", [])
+    if idx < len(titles):
+        data["current_title"] = titles[idx]
+        save_user(uid, data)
+    await query.edit_message_text(_settings_text(data), reply_markup=_settings_buttons(data))
 
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -817,6 +908,22 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         set_glossary(data, glossary)
         save_user(uid, data)
 
+        # Auto-push new glossary entries to sheet
+        auto_push_note = ""
+        if SHEETS_AVAILABLE and glossary and data.get("sheet_id") and data.get("current_title"):
+            creds_path = os.path.join(DATA_DIR, "credentials.json")
+            if os.path.exists(creds_path):
+                try:
+                    count = push_glossary_to_sheet(
+                        data["sheet_id"], data["current_title"], glossary,
+                        creds_path, data.get("sheet_name")
+                    )
+                    if count > 0:
+                        auto_push_note = f"\n[Sheet] บันทึก {count} คำใหม่ → {data['current_title']}"
+                except Exception as push_err:
+                    logger.error(f"Auto-push error: {push_err}")
+                    auto_push_note = f"\n[Sheet] Push ล้มเหลว: {push_err}"
+
         combined = "\n\n".join(all_pages)
         if glossary:
             combined += "\n\n[Glossary]"
@@ -826,14 +933,15 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if len(combined) > 4096:
             txt_bytes = combined.encode("utf-8")
             zip_name = doc.file_name.replace(".zip", ".txt") if doc.file_name else "translated.txt"
+            caption = f"Translated {total} pages | Glossary: {len(glossary)} entries{auto_push_note}"
             await msg.edit_text(f"Done\! {total} pages translated. Sending file...")
             await update.message.reply_document(
                 document=io.BytesIO(txt_bytes),
                 filename=zip_name,
-                caption=f"Translated {total} pages | Glossary: {len(glossary)} entries"
+                caption=caption,
             )
         else:
-            await msg.edit_text(combined)
+            await msg.edit_text(combined + auto_push_note)
 
     except Exception as e:
         logger.error(f"ZIP error: {e}")
@@ -887,10 +995,15 @@ def main():
     app.add_handler(CommandHandler("sync", cmd_sync))
     app.add_handler(CommandHandler("pushsheet", cmd_pushsheet))
     app.add_handler(CommandHandler("setsheetname", cmd_setsheetname))
+    app.add_handler(CommandHandler("addtitle", cmd_addtitle))
+    app.add_handler(CommandHandler("titles", cmd_titles))
+    app.add_handler(CommandHandler("deltitle", cmd_deltitle))
     app.add_handler(CallbackQueryHandler(callback_model, pattern="^model:"))
     app.add_handler(CallbackQueryHandler(callback_translate, pattern="^tr:"))
     app.add_handler(CallbackQueryHandler(callback_trmodel, pattern="^trm:"))
     app.add_handler(CallbackQueryHandler(callback_trgenre, pattern="^trg:"))
+    app.add_handler(CallbackQueryHandler(callback_trtitle, pattern="^trt:"))
+    app.add_handler(CallbackQueryHandler(callback_tts, pattern="^tts:"))
 
     app.add_handler(MessageHandler(filters.PHOTO, handle_image))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
