@@ -23,8 +23,7 @@ Commands:
 
 Usage: Just send an image or multiple images\!
 """
-import os, sys, json, re, io, zipfile, tempfile, logging
-from pathlib import Path
+import os, sys, json, re, io, zipfile, logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -36,7 +35,7 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from telegram import Update, BotCommand
+    from telegram import Update
     from telegram.ext import (
         Application, CommandHandler, MessageHandler,
         filters, ContextTypes, CallbackQueryHandler
@@ -538,11 +537,12 @@ async def cmd_pushsheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Pull (/sync) works without credentials if sheet is public."
         )
         return
-    msg = await update.message.reply_text(f"Pushing glossary for '{prof}'...")
+    manga_title = data.get("current_title") or prof
+    msg = await update.message.reply_text(f"Pushing glossary for '{manga_title}'...")
     try:
         sheet_name = data.get("sheet_name")
-        count = push_glossary_to_sheet(sheet_id, prof, glossary, creds_path, sheet_name)
-        await msg.edit_text(f"Pushed {count} new entries to Sheet for '{prof}'")
+        count = push_glossary_to_sheet(sheet_id, manga_title, glossary, creds_path, sheet_name)
+        await msg.edit_text(f"Pushed {count} new entries to Sheet for '{manga_title}'")
     except Exception as e:
         await msg.edit_text(f"Error: {e}")
 
@@ -892,7 +892,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         api_key = data["api_key"]
         model_name = data.get("model", DEFAULT_MODEL)
-        genre_name = data.get("genre", "\u0e44\u0e21\u0e48\u0e23\u0e30\u0e1a\u0e38 (\u0e17\u0e31\u0e48\u0e27\u0e44\u0e1b)")
+        genre_name = data.get("genre", "ไม่ระบุ (ทั่วไป)")
         genre_ctx = GENRE_PRESETS.get(genre_name, "")
         glossary = get_glossary(data)
 
@@ -989,14 +989,13 @@ def main():
         print("ERROR: TELEGRAM_BOT_TOKEN environment variable is not set.")
         sys.exit(1)
 
-    # Write credentials.json from env var if not already present
+    # Write credentials.json from env var (always overwrite so changes take effect)
     creds_env = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
     if creds_env:
         creds_path = os.path.join(DATA_DIR, "credentials.json")
-        if not os.path.exists(creds_path):
-            with open(creds_path, "w", encoding="utf-8") as f:
-                f.write(creds_env)
-            logger.info("credentials.json written from GOOGLE_CREDENTIALS_JSON env var")
+        with open(creds_path, "w", encoding="utf-8") as f:
+            f.write(creds_env)
+        logger.info("credentials.json written from GOOGLE_CREDENTIALS_JSON env var")
 
     app = Application.builder().token(token).build()
 
