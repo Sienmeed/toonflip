@@ -124,6 +124,17 @@ def set_glossary(user_data, glossary):
     if prof and prof in user_data.get("profiles", {}):
         user_data["profiles"][prof]["glossary"] = glossary
 
+def get_custom_prompt(user_data):
+    prof = user_data.get("current_profile")
+    if prof and prof in user_data.get("profiles", {}):
+        return user_data["profiles"][prof].get("custom_prompt", "")
+    return ""
+
+def set_custom_prompt(user_data, prompt):
+    prof = user_data.get("current_profile")
+    if prof and prof in user_data.get("profiles", {}):
+        user_data["profiles"][prof]["custom_prompt"] = prompt
+
 def parse_glossary(text, existing):
     """Parse glossary from response text, merge with existing."""
     glossary = dict(existing)
@@ -157,6 +168,7 @@ def _settings_text(data):
     genre = data.get("genre", "ไม่ระบุ (ทั่วไป)")
     prof = data.get("current_profile") or "None"
     gloss = get_glossary(data)
+    custom = get_custom_prompt(data)
     lines = [
         f"Model: {model}",
         f"Genre: {genre}",
@@ -166,6 +178,8 @@ def _settings_text(data):
     if data.get("titles"):
         title = data.get("current_title") or "ยังไม่เลือก"
         lines.append(f"เรื่อง: {title}")
+    if custom:
+        lines.append(f"Custom prompt: {len(custom)} chars")
     lines.append("\nแก้ settings หรือกด Translate เลย")
     return "\n".join(lines)
 
@@ -181,13 +195,17 @@ def _settings_buttons(data):
     if data.get("titles"):
         title = data.get("current_title") or "เลือกชื่อเรื่อง..."
         rows.append([InlineKeyboardButton(f"📖 {title}", callback_data="tr:title")])
+    if data.get("current_profile"):
+        custom = get_custom_prompt(data)
+        label = f"✏️ Prompt (set)" if custom else "✏️ Prompt"
+        rows.append([InlineKeyboardButton(label, callback_data="tr:prompt")])
     return InlineKeyboardMarkup(rows)
 
 
 # ============================================================
 # GEMINI TRANSLATION
 # ============================================================
-def translate_image_bytes(img_bytes, api_key, model_name, genre_ctx, glossary_ctx):
+def translate_image_bytes(img_bytes, api_key, model_name, genre_ctx, glossary_ctx, custom_ctx=""):
     """Translate image bytes. Returns (text, glossary_section)."""
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
@@ -195,6 +213,8 @@ def translate_image_bytes(img_bytes, api_key, model_name, genre_ctx, glossary_ct
     sys_prompt = PROMPT_SINGLE
     if genre_ctx:
         sys_prompt += "\n\n" + genre_ctx
+    if custom_ctx:
+        sys_prompt += "\n\n[คำแนะนำพิเศษสำหรับเรื่องนี้]\n" + custom_ctx
     parts = []
     if glossary_ctx:
         parts.append(glossary_ctx + "\n")
@@ -253,6 +273,11 @@ HELP_TEXT = """*Manhwa Translator Bot*
 /addtitle `<ชื่อ>` - เพิ่มชื่อเรื่อง
 /titles - ดูและเลือกชื่อเรื่อง
 /deltitle `<ชื่อ>` - ลบชื่อเรื่อง
+
+*Custom Prompt (per profile):*
+/setprompt `<คำแนะนำ>` - ตั้ง instruction พิเศษสำหรับ profile นี้
+/prompt - ดู custom prompt ปัจจุบัน
+/clearprompt - ลบ custom prompt
 
 *วิธีใช้:*
 1. /setkey ตั้ง API Key
@@ -619,6 +644,55 @@ async def cmd_deltitle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"ลบ '{name}' แล้ว")
 
 
+async def cmd_setprompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    data = load_user(uid)
+    if not data.get("current_profile"):
+        await update.message.reply_text("เลือก profile ก่อน: /newprofile หรือ /select")
+        return
+    if not ctx.args:
+        await update.message.reply_text(
+            "Usage: /setprompt <คำแนะนำ>\n\n"
+            "ตัวอย่าง:\n"
+            "/setprompt ใช้สรรพนาม ข้า/ท่าน ตลอด\n"
+            "/setprompt ตัวเอกชื่อ จอน แปลว่า จอนซอนอู ทับศัพท์เสมอ\n"
+            "/setprompt น้ำเสียงเป็นทางการ สุภาพ ไม่ใช้คำสแลง"
+        )
+        return
+    prompt = " ".join(ctx.args)
+    set_custom_prompt(data, prompt)
+    save_user(uid, data)
+    prof = data.get("current_profile")
+    await update.message.reply_text(f"ตั้ง custom prompt สำหรับ [{prof}] แล้ว:\n\"{prompt}\"")
+
+
+async def cmd_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    data = load_user(uid)
+    prof = data.get("current_profile")
+    if not prof:
+        await update.message.reply_text("เลือก profile ก่อน")
+        return
+    custom = get_custom_prompt(data)
+    if custom:
+        await update.message.reply_text(f"Custom prompt [{prof}]:\n\"{custom}\"\n\nลบด้วย /clearprompt")
+    else:
+        await update.message.reply_text(
+            f"Custom prompt [{prof}]: ยังไม่ได้ตั้ง\n\nตั้งด้วย /setprompt <คำแนะนำ>"
+        )
+
+
+async def cmd_clearprompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    data = load_user(uid)
+    if not data.get("current_profile"):
+        await update.message.reply_text("เลือก profile ก่อน")
+        return
+    set_custom_prompt(data, "")
+    save_user(uid, data)
+    await update.message.reply_text("ลบ custom prompt แล้ว")
+
+
 async def callback_tts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Select title from /titles list."""
     query = update.callback_query
@@ -710,9 +784,10 @@ async def callback_translate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             genre_ctx = GENRE_PRESETS.get(genre_name, "")
             glossary = get_glossary(data)
             glossary_ctx = format_glossary_context(glossary)
+            custom_ctx = get_custom_prompt(data)
 
             translated, gloss_section = translate_image_bytes(
-                img_data, api_key, model_name, genre_ctx, glossary_ctx
+                img_data, api_key, model_name, genre_ctx, glossary_ctx, custom_ctx
             )
 
             if gloss_section:
@@ -797,6 +872,28 @@ async def callback_translate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             buttons.append([InlineKeyboardButton(f"{t}{mark}", callback_data=f"trt:{i}")])
         buttons.append([InlineKeyboardButton("<< Back", callback_data="tr:back")])
         await query.edit_message_text("เลือกชื่อเรื่องที่จะแปล:", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif action == "prompt":
+        prof = data.get("current_profile")
+        if not prof:
+            await query.answer("เลือก profile ก่อน", show_alert=True)
+            return
+        custom = get_custom_prompt(data)
+        text = f"Custom prompt [{prof}]:\n\n"
+        if custom:
+            text += f'"{custom}"\n\nใช้ /setprompt <text> เพื่อเปลี่ยน'
+        else:
+            text += "ยังไม่ได้ตั้ง\n\nใช้ /setprompt <text> เพื่อตั้ง\nเช่น:\n/setprompt ใช้สรรพนาม ข้า/ท่าน ตลอด"
+        buttons = []
+        if custom:
+            buttons.append([InlineKeyboardButton("ลบ prompt", callback_data="tr:clearprompt")])
+        buttons.append([InlineKeyboardButton("<< Back", callback_data="tr:back")])
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif action == "clearprompt":
+        set_custom_prompt(data, "")
+        save_user(uid, data)
+        await query.edit_message_text(_settings_text(data), reply_markup=_settings_buttons(data))
 
     elif action == "back":
         await query.edit_message_text(_settings_text(data), reply_markup=_settings_buttons(data))
@@ -895,6 +992,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         genre_name = data.get("genre", "ไม่ระบุ (ทั่วไป)")
         genre_ctx = GENRE_PRESETS.get(genre_name, "")
         glossary = get_glossary(data)
+        custom_ctx = get_custom_prompt(data)
 
         all_pages = []
         for i, (fname, img_data) in enumerate(images):
@@ -903,7 +1001,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             glossary_ctx = format_glossary_context(glossary)
             translated, gloss_section = translate_image_bytes(
-                img_data, api_key, model_name, genre_ctx, glossary_ctx
+                img_data, api_key, model_name, genre_ctx, glossary_ctx, custom_ctx
             )
 
             if gloss_section:
@@ -1020,6 +1118,9 @@ def main():
     app.add_handler(CommandHandler("addtitle", cmd_addtitle))
     app.add_handler(CommandHandler("titles", cmd_titles))
     app.add_handler(CommandHandler("deltitle", cmd_deltitle))
+    app.add_handler(CommandHandler("setprompt", cmd_setprompt))
+    app.add_handler(CommandHandler("prompt", cmd_prompt))
+    app.add_handler(CommandHandler("clearprompt", cmd_clearprompt))
     app.add_handler(CallbackQueryHandler(callback_model, pattern="^model:"))
     app.add_handler(CallbackQueryHandler(callback_translate, pattern="^tr:"))
     app.add_handler(CallbackQueryHandler(callback_trmodel, pattern="^trm:"))
