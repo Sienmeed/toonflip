@@ -61,6 +61,7 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 DEFAULT_MODEL = "gemini-3.1-pro-preview"
+NOVEL_CHUNK_SIZE = 3000  # chars per translation chunk
 
 GENRE_PRESETS = {
     "ไม่ระบุ (ทั่วไป)": "",
@@ -83,6 +84,24 @@ PROMPT_SINGLE = """คุณเป็นผู้เชี่ยวชาญแ�
 
 [ข้อมูลตัวละครและชื่อเฉพาะ]
 - ชื่อต้นฉบับ: [ต้นฉบับ], ชื่อแปล: [ไทย], คำอธิบาย: [เพศ (บทบาท) รายละเอียด]
+
+สำคัญ: [ข้อมูลตัวละครและชื่อเฉพาะ] ต้องอยู่ท้ายเสมอ"""
+
+PROMPT_NOVEL = """คุณเป็นนักแปลนิยายมืออาชีพ แปลจากต้นฉบับ (เกาหลี/จีน/ญี่ปุ่น/อังกฤษ) เป็นภาษาไทย
+หลักการสำคัญ:
+1. แปลครบทุกประโยค ห้ามข้าม ห้ามตัด ห้ามสรุปแทน
+2. ภาษาไทยธรรมชาติ อ่านลื่น เหมือนนิยายไทยต้นฉบับ
+3. รักษาน้ำเสียงและอารมณ์ต้นฉบับ (ตึงเครียด/อบอุ่น/ตลก/เศร้า) ให้ยังรู้สึกได้
+4. รักษาโครงสร้างย่อหน้า — บรรทัดว่างตรงไหนให้คงไว้
+5. บทพูดของแต่ละตัวละคร รักษาบุคลิกและสำเนียงตาม Glossary
+6. ชื่อเฉพาะใช้ตาม Glossary เท่านั้น ห้ามสะกดต่างหรือเปลี่ยน
+7. ถ้ามีบริบทจากตอนที่แล้ว ให้ใช้รักษาความต่อเนื่องของน้ำเสียงและชื่อตัวละคร
+
+รูปแบบ output:
+[เนื้อหาที่แปลแล้วเต็มๆ ตามลำดับ]
+
+[ข้อมูลตัวละครและชื่อเฉพาะ]
+- ชื่อต้นฉบับ: [...], ชื่อแปล: [...], คำอธิบาย: [...]
 
 สำคัญ: [ข้อมูลตัวละครและชื่อเฉพาะ] ต้องอยู่ท้ายเสมอ"""
 
@@ -134,6 +153,72 @@ def set_custom_prompt(user_data, prompt):
     prof = user_data.get("current_profile")
     if prof and prof in user_data.get("profiles", {}):
         user_data["profiles"][prof]["custom_prompt"] = prompt
+
+def get_novel_context(user_data):
+    """Get rolling context (tail of last translated output) for continuity."""
+    prof = user_data.get("current_profile")
+    if prof and prof in user_data.get("profiles", {}):
+        return user_data["profiles"][prof].get("novel_context", "")
+    return ""
+
+def set_novel_context(user_data, context):
+    prof = user_data.get("current_profile")
+    if prof and prof in user_data.get("profiles", {}):
+        user_data["profiles"][prof]["novel_context"] = context
+
+
+def split_novel_text(text, max_chars=NOVEL_CHUNK_SIZE):
+    """Split novel text into chunks at natural paragraph boundaries."""
+    paragraphs = re.split(r'\n{2,}', text.strip())
+    chunks, current, current_len = [], [], 0
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        if current and current_len + len(para) + 2 > max_chars:
+            chunks.append("\n\n".join(current))
+            current, current_len = [para], len(para)
+        else:
+            current.append(para)
+            current_len += len(para) + 2
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks or [text.strip()]
+
+
+def translate_novel_chunk(text, api_key, model_name, genre_ctx, glossary_ctx,
+                           custom_ctx="", prev_context=""):
+    """Translate a novel text chunk with rolling context for continuity."""
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name)
+
+    sys_prompt = PROMPT_NOVEL
+    if genre_ctx:
+        sys_prompt += "\n\n" + genre_ctx
+    if custom_ctx:
+        sys_prompt += "\n\n[คำแนะนำพิเศษสำหรับเรื่องนี้]\n" + custom_ctx
+
+    parts = []
+    if glossary_ctx:
+        parts.append(glossary_ctx + "\n")
+    if prev_context:
+        parts.append(
+            f"[บริบทจากตอนที่แปลไปแล้ว — ใช้รักษาความต่อเนื่องของน้ำเสียงและชื่อตัวละคร]\n"
+            f"{prev_context}\n[--- จบบริบท ---]\n"
+        )
+    parts.append(f"แปลข้อความต่อไปนี้เป็นภาษาไทย:\n\n{text}")
+
+    response = model.generate_content(
+        [{"role": "user", "parts": [sys_prompt, "\n".join(parts)]}],
+        generation_config=genai.GenerationConfig(temperature=0.3, max_output_tokens=8192),
+        request_options={"timeout": 180},
+    )
+    full = response.text.strip()
+    marker = "[ข้อมูลตัวละครและชื่อเฉพาะ]"
+    if marker in full:
+        idx = full.index(marker)
+        return full[:idx].strip(), full[idx:].strip()
+    return full, ""
 
 def parse_glossary(text, existing):
     """Parse glossary from response text, merge with existing."""
@@ -278,6 +363,10 @@ HELP_TEXT = """*Manhwa Translator Bot*
 /setprompt `<คำแนะนำ>` - ตั้ง instruction พิเศษสำหรับ profile นี้
 /prompt - ดู custom prompt ปัจจุบัน
 /clearprompt - ลบ custom prompt
+
+*Novel Mode (แปลนิยาย):*
+ส่งไฟล์ `.txt` → bot แบ่ง chunk อัตโนมัติ แปลต่อเนื่องหลายตอน
+/resetnovel - ล้าง context (เริ่มนิยายเรื่องใหม่)
 
 *วิธีใช้:*
 1. /setkey ตั้ง API Key
@@ -720,8 +809,8 @@ async def callback_tts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 # IMAGE HANDLER - Show settings before translating
 # ============================================================
-# Store pending images per user
 _pending_images = {}
+_pending_novels = {}   # uid -> {"chunks": [...], "filename": "..."}
 
 async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle incoming photo - show settings confirmation first."""
@@ -758,6 +847,149 @@ async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _pending_images[uid] = img_data
 
     await update.message.reply_text(_settings_text(data), reply_markup=_settings_buttons(data))
+
+
+async def handle_novel_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                            text_content: str, filename: str):
+    """Show novel translation preview and settings before translating."""
+    uid = update.effective_user.id
+    data = load_user(uid)
+
+    if not data.get("api_key"):
+        await update.message.reply_text("Set API key first: /setkey <key>")
+        return
+
+    text_content = text_content.strip()
+    if not text_content:
+        await update.message.reply_text("ไฟล์ว่างเปล่า")
+        return
+
+    chunks = split_novel_text(text_content)
+    _pending_novels[uid] = {"chunks": chunks, "filename": filename}
+
+    prof = data.get("current_profile") or "None"
+    title = data.get("current_title") or "ไม่ระบุ"
+    prev_ctx = get_novel_context(data)
+    custom = get_custom_prompt(data)
+
+    info = (
+        f"📖 Novel mode\n"
+        f"ไฟล์: {filename}\n"
+        f"ขนาด: {len(text_content):,} chars → {len(chunks)} chunks\n"
+        f"Profile: {prof}  |  เรื่อง: {title}\n"
+        f"Custom prompt: {'ตั้งแล้ว' if custom else 'ไม่ได้ตั้ง'}\n"
+        f"บริบทต่อเนื่อง: {'มีจากตอนที่แล้ว ✓' if prev_ctx else 'เริ่มใหม่'}\n\n"
+        f"กด Translate เพื่อเริ่มแปล"
+    )
+    buttons = [[InlineKeyboardButton("📖 Translate Novel", callback_data="novel:go")]]
+    if prev_ctx:
+        buttons.append([InlineKeyboardButton("🔄 เริ่มใหม่ (ล้าง context)", callback_data="novel:fresh")])
+    await update.message.reply_text(info, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def callback_novel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle novel translation callbacks."""
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    data = load_user(uid)
+    action = query.data[6:]  # remove "novel:"
+
+    if action == "fresh":
+        set_novel_context(data, "")
+        save_user(uid, data)
+
+    # Both "go" and "fresh" proceed to translate
+    novel_data = _pending_novels.pop(uid, None)
+    if not novel_data:
+        await query.edit_message_text("ไม่มีไฟล์รอแปล กรุณาส่งไฟล์ .txt มาใหม่")
+        return
+
+    chunks = novel_data["chunks"]
+    filename = novel_data["filename"]
+    total = len(chunks)
+    msg = query.message
+
+    api_key = data.get("api_key", "")
+    if not api_key:
+        await msg.edit_text("Set API key first: /setkey <key>")
+        return
+
+    model_name = data.get("model", DEFAULT_MODEL)
+    genre_ctx = GENRE_PRESETS.get(data.get("genre", "ไม่ระบุ (ทั่วไป)"), "")
+    glossary = get_glossary(data)
+    custom_ctx = get_custom_prompt(data)
+    prev_context = get_novel_context(data)
+
+    translated_chunks = []
+    try:
+        for i, chunk in enumerate(chunks):
+            await msg.edit_text(f"📖 กำลังแปล {i+1}/{total}...")
+            glossary_ctx = format_glossary_context(glossary)
+
+            translated, gloss_section = translate_novel_chunk(
+                chunk, api_key, model_name, genre_ctx, glossary_ctx,
+                custom_ctx, prev_context
+            )
+
+            if gloss_section:
+                glossary = parse_glossary(gloss_section, glossary)
+
+            translated_chunks.append(translated)
+            # Rolling context: keep last 600 chars of translated output
+            tail = translated[-600:] if len(translated) > 600 else translated
+            prev_context = tail
+
+        # Save glossary + rolling context
+        set_glossary(data, glossary)
+        set_novel_context(data, prev_context)
+        save_user(uid, data)
+
+        # Auto-push glossary to sheet
+        auto_push_note = ""
+        if SHEETS_AVAILABLE and glossary and data.get("sheet_id") and data.get("current_title"):
+            creds_path = os.path.join(DATA_DIR, "credentials.json")
+            if os.path.exists(creds_path):
+                try:
+                    count = push_glossary_to_sheet(
+                        data["sheet_id"], data["current_title"], glossary,
+                        creds_path, data.get("sheet_name")
+                    )
+                    if count > 0:
+                        auto_push_note = f"\n[Sheet] บันทึก {count} คำใหม่ → {data['current_title']}"
+                except Exception as push_err:
+                    auto_push_note = f"\n[Sheet] Push ล้มเหลว: {push_err}"
+
+        combined = "\n\n---\n\n".join(translated_chunks)
+        out_name = filename.rsplit(".", 1)[0] + "_TH.txt"
+        caption = (
+            f"📖 {filename}\n"
+            f"แปลแล้ว {total} chunks | Glossary: {len(glossary)} entries"
+            f"{auto_push_note}"
+        )
+
+        await msg.edit_text(f"✅ แปลเสร็จ! {total} chunks กำลังส่งไฟล์...")
+        await msg.reply_document(
+            document=io.BytesIO(combined.encode("utf-8")),
+            filename=out_name,
+            caption=caption,
+        )
+
+    except Exception as e:
+        logger.error(f"Novel translation error: {e}")
+        await msg.edit_text(f"Error: {e}")
+
+
+async def cmd_resetnovel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Clear novel rolling context for current profile."""
+    uid = update.effective_user.id
+    data = load_user(uid)
+    if not data.get("current_profile"):
+        await update.message.reply_text("เลือก profile ก่อน")
+        return
+    set_novel_context(data, "")
+    save_user(uid, data)
+    await update.message.reply_text("ล้าง novel context แล้ว — แปลตอนต่อไปจะเริ่มใหม่")
 
 
 async def callback_translate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -957,6 +1189,16 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_image(update, ctx)
         return
 
+    # Check if text file (novel)
+    if fname.lower().endswith(".txt"):
+        file = await ctx.bot.get_file(doc.file_id)
+        buf = io.BytesIO()
+        await file.download_to_memory(buf)
+        buf.seek(0)
+        text_content = buf.read().decode("utf-8", errors="replace")
+        await handle_novel_file(update, ctx, text_content, fname)
+        return
+
     # Check if ZIP
     if not fname.lower().endswith(".zip"):
         await update.message.reply_text("Send an image (PNG/JPG) or ZIP file")
@@ -1121,6 +1363,8 @@ def main():
     app.add_handler(CommandHandler("setprompt", cmd_setprompt))
     app.add_handler(CommandHandler("prompt", cmd_prompt))
     app.add_handler(CommandHandler("clearprompt", cmd_clearprompt))
+    app.add_handler(CommandHandler("resetnovel", cmd_resetnovel))
+    app.add_handler(CallbackQueryHandler(callback_novel, pattern="^novel:"))
     app.add_handler(CallbackQueryHandler(callback_model, pattern="^model:"))
     app.add_handler(CallbackQueryHandler(callback_translate, pattern="^tr:"))
     app.add_handler(CallbackQueryHandler(callback_trmodel, pattern="^trm:"))
