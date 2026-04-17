@@ -959,7 +959,7 @@ def main():
             with open(cfg_path, "r") as f:
                 token = f.read().strip()
 
-    if not token:
+    if not token and sys.stdin.isatty():
         print("="*50)
         print("  Manhwa Translator - Telegram Bot")
         print("="*50)
@@ -972,8 +972,17 @@ def main():
             print(f"Token saved to {cfg_path}")
 
     if not token:
-        print("No token provided. Exiting.")
-        return
+        print("ERROR: TELEGRAM_BOT_TOKEN environment variable is not set.")
+        sys.exit(1)
+
+    # Write credentials.json from env var if not already present
+    creds_env = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+    if creds_env:
+        creds_path = os.path.join(DATA_DIR, "credentials.json")
+        if not os.path.exists(creds_path):
+            with open(creds_path, "w", encoding="utf-8") as f:
+                f.write(creds_env)
+            logger.info("credentials.json written from GOOGLE_CREDENTIALS_JSON env var")
 
     app = Application.builder().token(token).build()
 
