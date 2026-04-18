@@ -936,7 +936,41 @@ async def callback_tts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # IMAGE HANDLER - Show settings before translating
 # ============================================================
 _pending_images = {}
-_pending_novels = {}   # uid -> {"chunks": [...], "filename": "..."}
+_pending_novels = {}   # uid -> {"chunks": [...], "filename": "...", "char_count": int}
+_stop_novel = set()    # uids that requested stop
+
+
+def _novel_preview_text(data, filename, char_count, chunk_count):
+    model = data.get("model", DEFAULT_MODEL)
+    genre = data.get("genre", "ไม่ระบุ (ทั่วไป)")
+    prof = data.get("current_profile") or "None"
+    title = data.get("current_title") or "ไม่ระบุ"
+    prev_ctx = get_novel_context(data)
+    custom = get_custom_prompt(data)
+    return (
+        f"📖 Novel mode\n"
+        f"ไฟล์: {filename}\n"
+        f"ขนาด: {char_count:,} chars → {chunk_count} chunks\n\n"
+        f"Model: {model}\n"
+        f"Genre: {genre}\n"
+        f"Profile: {prof}  |  เรื่อง: {title}\n"
+        f"Custom prompt: {'ตั้งแล้ว ✓' if custom else 'ไม่ได้ตั้ง'}\n"
+        f"บริบทต่อเนื่อง: {'มีจากตอนที่แล้ว ✓' if prev_ctx else 'เริ่มใหม่'}\n\n"
+        f"กด Translate เพื่อเริ่มแปล"
+    )
+
+
+def _novel_preview_buttons(data):
+    rows = [
+        [InlineKeyboardButton("📖 Translate Novel", callback_data="novel:go")],
+        [
+            InlineKeyboardButton("🤖 Model", callback_data="novel:model"),
+            InlineKeyboardButton("🎭 Genre", callback_data="novel:genre"),
+        ],
+    ]
+    if get_novel_context(data):
+        rows.append([InlineKeyboardButton("🔄 เริ่มใหม่ (ล้าง context)", callback_data="novel:fresh")])
+    return InlineKeyboardMarkup(rows)
 
 async def handle_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle incoming photo - show settings confirmation first."""
@@ -991,26 +1025,13 @@ async def handle_novel_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         return
 
     chunks = split_novel_text(text_content)
-    _pending_novels[uid] = {"chunks": chunks, "filename": filename}
+    char_count = len(text_content)
+    _pending_novels[uid] = {"chunks": chunks, "filename": filename, "char_count": char_count}
 
-    prof = data.get("current_profile") or "None"
-    title = data.get("current_title") or "ไม่ระบุ"
-    prev_ctx = get_novel_context(data)
-    custom = get_custom_prompt(data)
-
-    info = (
-        f"📖 Novel mode\n"
-        f"ไฟล์: {filename}\n"
-        f"ขนาด: {len(text_content):,} chars → {len(chunks)} chunks\n"
-        f"Profile: {prof}  |  เรื่อง: {title}\n"
-        f"Custom prompt: {'ตั้งแล้ว' if custom else 'ไม่ได้ตั้ง'}\n"
-        f"บริบทต่อเนื่อง: {'มีจากตอนที่แล้ว ✓' if prev_ctx else 'เริ่มใหม่'}\n\n"
-        f"กด Translate เพื่อเริ่มแปล"
+    await update.message.reply_text(
+        _novel_preview_text(data, filename, char_count, len(chunks)),
+        reply_markup=_novel_preview_buttons(data),
     )
-    buttons = [[InlineKeyboardButton("📖 Translate Novel", callback_data="novel:go")]]
-    if prev_ctx:
-        buttons.append([InlineKeyboardButton("🔄 เริ่มใหม่ (ล้าง context)", callback_data="novel:fresh")])
-    await update.message.reply_text(info, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def callback_novel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1021,11 +1042,59 @@ async def callback_novel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = load_user(uid)
     action = query.data[6:]  # remove "novel:"
 
+    # --- Stop ---
+    if action == "stop":
+        _stop_novel.add(uid)
+        await query.answer("⏹ กำลังหยุด... รอ chunk ปัจจุบันเสร็จก่อน", show_alert=True)
+        return
+
+    # --- Model/Genre/Back (settings within novel preview) ---
+    if action == "model":
+        novel_data = _pending_novels.get(uid)
+        if not novel_data:
+            await query.edit_message_text("ไม่มีไฟล์รอแปล ส่งไฟล์ .txt มาใหม่")
+            return
+        current = data.get("model", DEFAULT_MODEL)
+        buttons = [
+            [InlineKeyboardButton(f"{'>> ' if m == current else ''}{m}", callback_data=f"nvm:{m}")]
+            for m in AVAILABLE_MODELS
+        ]
+        buttons.append([InlineKeyboardButton("<< Back", callback_data="novel:back")])
+        await query.edit_message_text("เลือก Model:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if action == "genre":
+        novel_data = _pending_novels.get(uid)
+        if not novel_data:
+            await query.edit_message_text("ไม่มีไฟล์รอแปล ส่งไฟล์ .txt มาใหม่")
+            return
+        current = data.get("genre", "ไม่ระบุ (ทั่วไป)")
+        buttons = [
+            [InlineKeyboardButton(f"{'>> ' if g == current else ''}{g}", callback_data=f"nvg:{i}")]
+            for i, g in enumerate(GENRE_LIST)
+        ]
+        buttons.append([InlineKeyboardButton("<< Back", callback_data="novel:back")])
+        await query.edit_message_text("เลือก Genre:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if action == "back":
+        novel_data = _pending_novels.get(uid)
+        if not novel_data:
+            await query.edit_message_text("ไม่มีไฟล์รอแปล ส่งไฟล์ .txt มาใหม่")
+            return
+        await query.edit_message_text(
+            _novel_preview_text(data, novel_data["filename"],
+                                novel_data["char_count"], len(novel_data["chunks"])),
+            reply_markup=_novel_preview_buttons(data),
+        )
+        return
+
+    # --- Fresh: clear context then fall through to translate ---
     if action == "fresh":
         set_novel_context(data, "")
         save_user(uid, data)
 
-    # Both "go" and "fresh" proceed to translate
+    # --- Go / Fresh → translate ---
     novel_data = _pending_novels.pop(uid, None)
     if not novel_data:
         await query.edit_message_text("ไม่มีไฟล์รอแปล กรุณาส่งไฟล์ .txt มาใหม่")
@@ -1046,26 +1115,31 @@ async def callback_novel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     glossary = get_glossary(data)
     custom_ctx = get_custom_prompt(data)
     prev_context = get_novel_context(data)
+    _stop_novel.discard(uid)
 
+    stop_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Stop", callback_data="novel:stop")]])
     translated_chunks = []
+    stopped = False
+
     try:
         for i, chunk in enumerate(chunks):
-            await msg.edit_text(f"📖 กำลังแปล {i+1}/{total}...")
-
+            if uid in _stop_novel:
+                _stop_novel.discard(uid)
+                stopped = True
+                break
+            await msg.edit_text(
+                f"📖 กำลังแปล {i+1}/{total}  (model: {model_name})",
+                reply_markup=stop_kb,
+            )
             translated, gloss_section = translate_novel_chunk(
                 chunk, api_key, model_name, genre_ctx, glossary,
                 custom_ctx, prev_context, chunk_num=i+1
             )
-
             if gloss_section:
                 glossary = parse_glossary(gloss_section, glossary)
-
             translated_chunks.append(translated)
-            # Rolling context: keep last 600 chars of translated output
-            tail = translated[-600:] if len(translated) > 600 else translated
-            prev_context = tail
+            prev_context = translated[-600:] if len(translated) > 600 else translated
 
-        # Save glossary + rolling context
         set_glossary(data, glossary)
         set_novel_context(data, prev_context)
         save_user(uid, data)
@@ -1085,15 +1159,22 @@ async def callback_novel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 except Exception as push_err:
                     auto_push_note = f"\n[Sheet] Push ล้มเหลว: {push_err}"
 
+        done_chunks = len(translated_chunks)
         combined = "\n\n---\n\n".join(translated_chunks)
-        out_name = filename.rsplit(".", 1)[0] + "_TH.txt"
+
+        # Output filename: prefer current_title, fallback to original filename
+        title_slug = data.get("current_title") or filename.rsplit(".", 1)[0]
+        out_name = f"{title_slug}_TH.txt"
+
+        stop_note = f" (หยุดที่ chunk {done_chunks}/{total})" if stopped else ""
         caption = (
-            f"📖 {filename}\n"
-            f"แปลแล้ว {total} chunks | Glossary: {len(glossary)} entries"
-            f"{auto_push_note}"
+            f"📖 {title_slug}\n"
+            f"แปลแล้ว {done_chunks}/{total} chunks | Glossary: {len(glossary)} entries"
+            f"{stop_note}{auto_push_note}"
         )
 
-        await msg.edit_text(f"✅ แปลเสร็จ! {total} chunks กำลังส่งไฟล์...")
+        status = f"⏹ หยุดที่ {done_chunks}/{total} chunks" if stopped else f"✅ แปลเสร็จ! {done_chunks} chunks"
+        await msg.edit_text(f"{status} — กำลังส่งไฟล์...")
         await msg.reply_document(
             document=io.BytesIO(combined.encode("utf-8")),
             filename=out_name,
@@ -1297,6 +1378,49 @@ async def callback_trtitle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(_settings_text(data), reply_markup=_settings_buttons(data))
 
 
+async def callback_nvmodel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle model selection during novel translate flow."""
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    model_name = query.data[4:]  # remove "nvm:"
+    data = load_user(uid)
+    data["model"] = model_name
+    save_user(uid, data)
+    novel_data = _pending_novels.get(uid)
+    if novel_data:
+        await query.edit_message_text(
+            _novel_preview_text(data, novel_data["filename"],
+                                novel_data["char_count"], len(novel_data["chunks"])),
+            reply_markup=_novel_preview_buttons(data),
+        )
+    else:
+        await query.edit_message_text(f"Model set to: {model_name}\nส่งไฟล์ .txt มาใหม่เพื่อแปล")
+
+
+async def callback_nvgenre(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle genre selection during novel translate flow."""
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    idx = int(query.data[4:])  # remove "nvg:"
+    data = load_user(uid)
+    data["genre"] = GENRE_LIST[idx]
+    prof = data.get("current_profile")
+    if prof and prof in data.get("profiles", {}):
+        data["profiles"][prof]["genre"] = GENRE_LIST[idx]
+    save_user(uid, data)
+    novel_data = _pending_novels.get(uid)
+    if novel_data:
+        await query.edit_message_text(
+            _novel_preview_text(data, novel_data["filename"],
+                                novel_data["char_count"], len(novel_data["chunks"])),
+            reply_markup=_novel_preview_buttons(data),
+        )
+    else:
+        await query.edit_message_text(f"Genre set to: {GENRE_LIST[idx]}\nส่งไฟล์ .txt มาใหม่เพื่อแปล")
+
+
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle ZIP or image files."""
     uid = update.effective_user.id
@@ -1490,6 +1614,8 @@ def main():
     app.add_handler(CommandHandler("clearprompt", cmd_clearprompt))
     app.add_handler(CommandHandler("resetnovel", cmd_resetnovel))
     app.add_handler(CallbackQueryHandler(callback_novel, pattern="^novel:"))
+    app.add_handler(CallbackQueryHandler(callback_nvmodel, pattern="^nvm:"))
+    app.add_handler(CallbackQueryHandler(callback_nvgenre, pattern="^nvg:"))
     app.add_handler(CallbackQueryHandler(callback_model, pattern="^model:"))
     app.add_handler(CallbackQueryHandler(callback_translate, pattern="^tr:"))
     app.add_handler(CallbackQueryHandler(callback_trmodel, pattern="^trm:"))
