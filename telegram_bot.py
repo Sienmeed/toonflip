@@ -53,10 +53,17 @@ try:
 except ImportError:
     SHEETS_AVAILABLE = False
 
+try:
+    import deepl as deepl_lib
+    DEEPL_AVAILABLE = True
+except ImportError:
+    DEEPL_AVAILABLE = False
+
 # ============================================================
 # CONFIG
 # ============================================================
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+DEEPL_AUTH_KEY_ENV = os.environ.get("DEEPL_AUTH_KEY", "")  # shared fallback
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -298,6 +305,15 @@ def set_pronoun_style(user_data, style):
     else:
         user_data["pronoun_style"] = style
 
+def get_novel_engine(user_data):
+    return user_data.get("novel_engine", "gemini")
+
+def set_novel_engine(user_data, engine):
+    user_data["novel_engine"] = engine
+
+def get_deepl_key(user_data):
+    return user_data.get("deepl_key", "") or DEEPL_AUTH_KEY_ENV
+
 def get_novel_context(user_data):
     """Get rolling context (tail of last translated output) for continuity."""
     prof = user_data.get("current_profile")
@@ -375,6 +391,14 @@ def translate_novel_chunk(text, api_key, model_name, genre_ctx, glossary,
         idx = full.index(marker)
         return full[:idx].strip(), full[idx:].strip()
     return full, ""
+
+
+def translate_novel_chunk_deepl(text, deepl_key):
+    """Translate a text chunk using DeepL API. Returns (translated, glossary_section='')."""
+    translator = deepl_lib.Translator(deepl_key)
+    result = translator.translate_text(text, target_lang="TH")
+    return result.text, ""
+
 
 def parse_glossary(text, existing):
     """Parse glossary from response text, merge with existing."""
@@ -596,6 +620,23 @@ async def cmd_setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save_user(uid, data)
     masked = key[:8] + "..." + key[-4:] if len(key) > 12 else "***"
     await update.message.reply_text(f"API Key saved: {masked}")
+
+async def cmd_setdeeplkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text(
+            "Usage: /setdeeplkey <your_deepl_api_key>\n\n"
+            "รับ API key ฟรีได้ที่ deepl.com/pro (500,000 chars/เดือน)\n"
+            "Free tier key จะลงท้ายด้วย :fx"
+        )
+        return
+    data = load_user(uid)
+    key = ctx.args[0].strip("<>\"' ")
+    data["deepl_key"] = key
+    save_user(uid, data)
+    masked = key[:6] + "..." + key[-4:] if len(key) > 10 else "***"
+    await update.message.reply_text(f"DeepL API Key saved: {masked}")
+
 
 AVAILABLE_MODELS = [
     "gemini-3.1-pro-preview",
@@ -1012,37 +1053,54 @@ _pending_novels = {}   # uid -> {"chunks": [...], "filename": "...", "char_count
 _stop_novel = set()    # uids that requested stop
 
 
+def _engine_label(user_data):
+    engine = get_novel_engine(user_data)
+    if engine == "deepl":
+        has_key = bool(get_deepl_key(user_data))
+        return f"🔵 DeepL{'✓' if has_key else ' (ยังไม่มี key)'}"
+    return "🤖 Gemini"
+
+
 def _novel_preview_text(data, filename, char_count, chunk_count):
-    model = data.get("model", DEFAULT_MODEL)
-    genre = data.get("genre", "ไม่ระบุ (ทั่วไป)")
+    engine = get_novel_engine(data)
     prof = data.get("current_profile") or "None"
     title = data.get("current_title") or "ไม่ระบุ"
     prev_ctx = get_novel_context(data)
-    custom = get_custom_prompt(data)
-    pronoun = _pronoun_label(data)
-    return (
-        f"📖 Novel mode\n"
-        f"ไฟล์: {filename}\n"
-        f"ขนาด: {char_count:,} chars → {chunk_count} chunks\n\n"
-        f"Model: {model}\n"
-        f"Genre: {genre}\n"
-        f"Profile: {prof}  |  เรื่อง: {title}\n"
-        f"สรรพนาม: {pronoun}\n"
-        f"Custom prompt: {'ตั้งแล้ว ✓' if custom else 'ไม่ได้ตั้ง'}\n"
-        f"บริบทต่อเนื่อง: {'มีจากตอนที่แล้ว ✓' if prev_ctx else 'เริ่มใหม่'}\n\n"
-        f"กด Translate เพื่อเริ่มแปล"
-    )
+    lines = [
+        f"📖 Novel mode",
+        f"ไฟล์: {filename}",
+        f"ขนาด: {char_count:,} chars → {chunk_count} chunks",
+        "",
+        f"Engine: {_engine_label(data)}",
+    ]
+    if engine == "gemini":
+        lines += [
+            f"Model: {data.get('model', DEFAULT_MODEL)}",
+            f"Genre: {data.get('genre', 'ไม่ระบุ (ทั่วไป)')}",
+            f"สรรพนาม: {_pronoun_label(data)}",
+            f"Custom prompt: {'ตั้งแล้ว ✓' if get_custom_prompt(data) else 'ไม่ได้ตั้ง'}",
+        ]
+    lines += [
+        f"Profile: {prof}  |  เรื่อง: {title}",
+        f"บริบทต่อเนื่อง: {'มีจากตอนที่แล้ว ✓' if prev_ctx else 'เริ่มใหม่'}",
+        "",
+        "กด Translate เพื่อเริ่มแปล",
+    ]
+    return "\n".join(lines)
 
 
 def _novel_preview_buttons(data):
+    engine = get_novel_engine(data)
     rows = [
         [InlineKeyboardButton("📖 Translate Novel", callback_data="novel:go")],
-        [
+        [InlineKeyboardButton(f"{_engine_label(data)}", callback_data="novel:engine")],
+    ]
+    if engine == "gemini":
+        rows.append([
             InlineKeyboardButton("🤖 Model", callback_data="novel:model"),
             InlineKeyboardButton("🎭 Genre", callback_data="novel:genre"),
-        ],
-        [InlineKeyboardButton(f"💬 {_pronoun_label(data)}", callback_data="novel:pronouns")],
-    ]
+        ])
+        rows.append([InlineKeyboardButton(f"💬 {_pronoun_label(data)}", callback_data="novel:pronouns")])
     if data.get("titles"):
         title = data.get("current_title") or "เลือกชื่อเรื่อง..."
         rows.append([InlineKeyboardButton(f"📖 {title}", callback_data="novel:title")])
@@ -1173,6 +1231,26 @@ async def callback_novel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("เลือกชื่อเรื่อง:", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
+    if action == "engine":
+        current = get_novel_engine(data)
+        options = [("🤖 Gemini — AI แปล + Glossary + สรรพนาม", "gemini")]
+        if DEEPL_AVAILABLE:
+            deepl_key = get_deepl_key(data)
+            deepl_label = "🔵 DeepL — แปลตรง คุณภาพสูง"
+            if not deepl_key:
+                deepl_label += " (ต้องตั้ง /setdeeplkey)"
+            options.append((deepl_label, "deepl"))
+        else:
+            options.append(("🔵 DeepL — (pip install deepl ก่อน)", "deepl"))
+        buttons = [
+            [InlineKeyboardButton(f"{'>> ' if e == current else ''}{label}",
+                                  callback_data=f"nve:{e}")]
+            for label, e in options
+        ]
+        buttons.append([InlineKeyboardButton("<< Back", callback_data="novel:back")])
+        await query.edit_message_text("เลือก Translation Engine:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
     if action == "pronouns":
         current = get_pronoun_style(data)
         buttons = [
@@ -1208,10 +1286,21 @@ async def callback_novel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = query.message
-    api_key = data.get("api_key", "")
-    if not api_key:
-        await msg.edit_text("Set API key first: /setkey <key>")
-        return
+    engine = get_novel_engine(data)
+
+    if engine == "deepl":
+        deepl_key = get_deepl_key(data)
+        if not deepl_key:
+            await msg.edit_text("ตั้ง DeepL API key ก่อน: /setdeeplkey <key>")
+            return
+        if not DEEPL_AVAILABLE:
+            await msg.edit_text("ไม่พบ deepl library — ติดตั้งด้วย: pip install deepl")
+            return
+    else:
+        api_key = data.get("api_key", "")
+        if not api_key:
+            await msg.edit_text("Set API key first: /setkey <key>")
+            return
 
     model_name = data.get("model", DEFAULT_MODEL)
     genre_ctx = GENRE_PRESETS.get(data.get("genre", "ไม่ระบุ (ทั่วไป)"), "")
@@ -1251,10 +1340,13 @@ async def callback_novel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         f"chunk {i+1}/{len(file_info['chunks'])}  (รวม {done_chunks}/{total_chunks})",
                         reply_markup=stop_kb,
                     )
-                    translated, gloss_section = translate_novel_chunk(
-                        chunk, api_key, model_name, genre_ctx, glossary,
-                        custom_ctx, prev_context, chunk_num=done_chunks, pronoun_ctx=pronoun_ctx
-                    )
+                    if engine == "deepl":
+                        translated, gloss_section = translate_novel_chunk_deepl(chunk, deepl_key)
+                    else:
+                        translated, gloss_section = translate_novel_chunk(
+                            chunk, api_key, model_name, genre_ctx, glossary,
+                            custom_ctx, prev_context, chunk_num=done_chunks, pronoun_ctx=pronoun_ctx
+                        )
                     if gloss_section:
                         glossary = parse_glossary(gloss_section, glossary)
                     file_translated.append(translated)
@@ -1308,10 +1400,13 @@ async def callback_novel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"📖 กำลังแปล {i+1}/{total}  (model: {model_name})",
                     reply_markup=stop_kb,
                 )
-                translated, gloss_section = translate_novel_chunk(
-                    chunk, api_key, model_name, genre_ctx, glossary,
-                    custom_ctx, prev_context, chunk_num=i+1, pronoun_ctx=pronoun_ctx
-                )
+                if engine == "deepl":
+                    translated, gloss_section = translate_novel_chunk_deepl(chunk, deepl_key)
+                else:
+                    translated, gloss_section = translate_novel_chunk(
+                        chunk, api_key, model_name, genre_ctx, glossary,
+                        custom_ctx, prev_context, chunk_num=i+1, pronoun_ctx=pronoun_ctx
+                    )
                 if gloss_section:
                     glossary = parse_glossary(gloss_section, glossary)
                 translated_chunks.append(translated)
@@ -1641,13 +1736,35 @@ async def callback_nvpronoun(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save_user(uid, data)
     novel_data = _pending_novels.get(uid)
     if novel_data:
+        chunk_count = novel_data.get("chunk_count") or len(novel_data.get("chunks", []))
         await query.edit_message_text(
             _novel_preview_text(data, novel_data["filename"],
-                                novel_data["char_count"], len(novel_data["chunks"])),
+                                novel_data["char_count"], chunk_count),
             reply_markup=_novel_preview_buttons(data),
         )
     else:
         await query.edit_message_text(f"สรรพนาม: {_pronoun_label(data)}\nส่งไฟล์ .txt มาใหม่เพื่อแปล")
+
+
+async def callback_nvengine(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle translation engine selection during novel flow."""
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    engine = query.data[4:]  # remove "nve:"
+    data = load_user(uid)
+    set_novel_engine(data, engine)
+    save_user(uid, data)
+    novel_data = _pending_novels.get(uid)
+    if novel_data:
+        chunk_count = novel_data.get("chunk_count") or len(novel_data.get("chunks", []))
+        await query.edit_message_text(
+            _novel_preview_text(data, novel_data["filename"],
+                                novel_data["char_count"], chunk_count),
+            reply_markup=_novel_preview_buttons(data),
+        )
+    else:
+        await query.edit_message_text(f"Engine set to: {engine}\nส่งไฟล์ .txt มาใหม่เพื่อแปล")
 
 
 async def handle_novel_zip(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
@@ -1925,11 +2042,13 @@ def main():
     app.add_handler(CommandHandler("prompt", cmd_prompt))
     app.add_handler(CommandHandler("clearprompt", cmd_clearprompt))
     app.add_handler(CommandHandler("resetnovel", cmd_resetnovel))
+    app.add_handler(CommandHandler("setdeeplkey", cmd_setdeeplkey))
     app.add_handler(CallbackQueryHandler(callback_novel, pattern="^novel:"))
     app.add_handler(CallbackQueryHandler(callback_nvmodel, pattern="^nvm:"))
     app.add_handler(CallbackQueryHandler(callback_nvgenre, pattern="^nvg:"))
     app.add_handler(CallbackQueryHandler(callback_nvtitle, pattern="^nvt:"))
     app.add_handler(CallbackQueryHandler(callback_nvpronoun, pattern="^nvpr:"))
+    app.add_handler(CallbackQueryHandler(callback_nvengine, pattern="^nve:"))
     app.add_handler(CallbackQueryHandler(callback_model, pattern="^model:"))
     app.add_handler(CallbackQueryHandler(callback_translate, pattern="^tr:"))
     app.add_handler(CallbackQueryHandler(callback_trmodel, pattern="^trm:"))
