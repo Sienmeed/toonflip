@@ -402,6 +402,23 @@ def format_glossary_context(glossary):
     return "\n".join(lines)
 
 
+def _auto_push(data, glossary):
+    """Push glossary to sheet; return status note string."""
+    if not (SHEETS_AVAILABLE and glossary and data.get("sheet_id") and data.get("current_title")):
+        return ""
+    creds_path = os.path.join(DATA_DIR, "credentials.json")
+    if not os.path.exists(creds_path):
+        return ""
+    try:
+        count = push_glossary_to_sheet(
+            data["sheet_id"], data["current_title"], glossary,
+            creds_path, data.get("sheet_name")
+        )
+        return f"\n[Sheet] บันทึก {count} คำใหม่ → {data['current_title']}" if count > 0 else ""
+    except Exception as e:
+        return f"\n[Sheet] Push ล้มเหลว: {e}"
+
+
 def _pronoun_label(user_data):
     """Return display name of current pronoun preset."""
     style = get_pronoun_style(user_data)
@@ -1181,11 +1198,7 @@ async def callback_novel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("ไม่มีไฟล์รอแปล กรุณาส่งไฟล์ .txt มาใหม่")
         return
 
-    chunks = novel_data["chunks"]
-    filename = novel_data["filename"]
-    total = len(chunks)
     msg = query.message
-
     api_key = data.get("api_key", "")
     if not api_key:
         await msg.edit_text("Set API key first: /setkey <key>")
@@ -1200,68 +1213,123 @@ async def callback_novel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _stop_novel.discard(uid)
 
     stop_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Stop", callback_data="novel:stop")]])
-    translated_chunks = []
     stopped = False
+    title_slug = data.get("current_title") or novel_data["filename"].rsplit(".", 1)[0]
 
     try:
-        for i, chunk in enumerate(chunks):
-            if uid in _stop_novel:
-                _stop_novel.discard(uid)
-                stopped = True
-                break
-            await msg.edit_text(
-                f"📖 กำลังแปล {i+1}/{total}  (model: {model_name})",
-                reply_markup=stop_kb,
-            )
-            translated, gloss_section = translate_novel_chunk(
-                chunk, api_key, model_name, genre_ctx, glossary,
-                custom_ctx, prev_context, chunk_num=i+1, pronoun_ctx=pronoun_ctx
-            )
-            if gloss_section:
-                glossary = parse_glossary(gloss_section, glossary)
-            translated_chunks.append(translated)
-            prev_context = translated[-600:] if len(translated) > 600 else translated
+        if novel_data.get("mode") == "zip":
+            # ── ZIP batch mode ──────────────────────────────────────
+            files = novel_data["files"]
+            total_files = len(files)
+            total_chunks = novel_data["chunk_count"]
+            done_chunks = 0
+            output_files = []
 
-        set_glossary(data, glossary)
-        set_novel_context(data, prev_context)
-        save_user(uid, data)
-
-        # Auto-push glossary to sheet
-        auto_push_note = ""
-        if SHEETS_AVAILABLE and glossary and data.get("sheet_id") and data.get("current_title"):
-            creds_path = os.path.join(DATA_DIR, "credentials.json")
-            if os.path.exists(creds_path):
-                try:
-                    count = push_glossary_to_sheet(
-                        data["sheet_id"], data["current_title"], glossary,
-                        creds_path, data.get("sheet_name")
+            for fi, file_info in enumerate(files):
+                if uid in _stop_novel:
+                    _stop_novel.discard(uid)
+                    stopped = True
+                    break
+                file_translated = []
+                for i, chunk in enumerate(file_info["chunks"]):
+                    if uid in _stop_novel:
+                        _stop_novel.discard(uid)
+                        stopped = True
+                        break
+                    done_chunks += 1
+                    await msg.edit_text(
+                        f"📦 [{fi+1}/{total_files}] {file_info['name']}\n"
+                        f"chunk {i+1}/{len(file_info['chunks'])}  (รวม {done_chunks}/{total_chunks})",
+                        reply_markup=stop_kb,
                     )
-                    if count > 0:
-                        auto_push_note = f"\n[Sheet] บันทึก {count} คำใหม่ → {data['current_title']}"
-                except Exception as push_err:
-                    auto_push_note = f"\n[Sheet] Push ล้มเหลว: {push_err}"
+                    translated, gloss_section = translate_novel_chunk(
+                        chunk, api_key, model_name, genre_ctx, glossary,
+                        custom_ctx, prev_context, chunk_num=done_chunks, pronoun_ctx=pronoun_ctx
+                    )
+                    if gloss_section:
+                        glossary = parse_glossary(gloss_section, glossary)
+                    file_translated.append(translated)
+                    prev_context = translated[-600:] if len(translated) > 600 else translated
 
-        done_chunks = len(translated_chunks)
-        combined = "\n\n---\n\n".join(translated_chunks)
+                if file_translated:
+                    output_files.append((file_info["name"], "\n\n---\n\n".join(file_translated)))
+                if stopped:
+                    break
 
-        # Output filename: prefer current_title, fallback to original filename
-        title_slug = data.get("current_title") or filename.rsplit(".", 1)[0]
-        out_name = f"{title_slug}_TH.txt"
+            set_glossary(data, glossary)
+            set_novel_context(data, prev_context)
+            save_user(uid, data)
 
-        stop_note = f" (หยุดที่ chunk {done_chunks}/{total})" if stopped else ""
-        caption = (
-            f"📖 {title_slug}\n"
-            f"แปลแล้ว {done_chunks}/{total} chunks | Glossary: {len(glossary)} entries"
-            f"{stop_note}{auto_push_note}"
-        )
+            auto_push_note = _auto_push(data, glossary)
 
-        status = f"⏹ หยุดที่ {done_chunks}/{total} chunks" if stopped else f"✅ แปลเสร็จ! {done_chunks} chunks"
-        await msg.edit_text(f"{status} — กำลังส่งไฟล์...")
-        await msg.reply_document(
-            document=io.BytesIO(combined.encode("utf-8")),
-            filename=out_name,
-            caption=caption,
-        )
+            out_zip_buf = io.BytesIO()
+            with zipfile.ZipFile(out_zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for orig_name, content in output_files:
+                    out_name = orig_name.rsplit(".", 1)[0] + "_TH.txt"
+                    zf.writestr(out_name, content.encode("utf-8"))
+            out_zip_buf.seek(0)
+
+            stop_note = f" (หยุดที่ {len(output_files)}/{total_files} ไฟล์)" if stopped else ""
+            caption = (
+                f"📦 {title_slug}\n"
+                f"{len(output_files)}/{total_files} ไฟล์ | Glossary: {len(glossary)} entries"
+                f"{stop_note}{auto_push_note}"
+            )
+            status = (f"⏹ หยุดที่ {len(output_files)}/{total_files} ไฟล์" if stopped
+                      else f"✅ แปลเสร็จ! {len(output_files)} ไฟล์")
+            await msg.edit_text(f"{status} — กำลังส่งไฟล์...")
+            await msg.reply_document(
+                document=out_zip_buf,
+                filename=f"{title_slug}_TH.zip",
+                caption=caption,
+            )
+
+        else:
+            # ── Single .txt mode ────────────────────────────────────
+            chunks = novel_data["chunks"]
+            total = len(chunks)
+            translated_chunks = []
+
+            for i, chunk in enumerate(chunks):
+                if uid in _stop_novel:
+                    _stop_novel.discard(uid)
+                    stopped = True
+                    break
+                await msg.edit_text(
+                    f"📖 กำลังแปล {i+1}/{total}  (model: {model_name})",
+                    reply_markup=stop_kb,
+                )
+                translated, gloss_section = translate_novel_chunk(
+                    chunk, api_key, model_name, genre_ctx, glossary,
+                    custom_ctx, prev_context, chunk_num=i+1, pronoun_ctx=pronoun_ctx
+                )
+                if gloss_section:
+                    glossary = parse_glossary(gloss_section, glossary)
+                translated_chunks.append(translated)
+                prev_context = translated[-600:] if len(translated) > 600 else translated
+
+            set_glossary(data, glossary)
+            set_novel_context(data, prev_context)
+            save_user(uid, data)
+
+            auto_push_note = _auto_push(data, glossary)
+
+            done_chunks = len(translated_chunks)
+            combined = "\n\n---\n\n".join(translated_chunks)
+            stop_note = f" (หยุดที่ chunk {done_chunks}/{total})" if stopped else ""
+            caption = (
+                f"📖 {title_slug}\n"
+                f"แปลแล้ว {done_chunks}/{total} chunks | Glossary: {len(glossary)} entries"
+                f"{stop_note}{auto_push_note}"
+            )
+            status = (f"⏹ หยุดที่ {done_chunks}/{total} chunks" if stopped
+                      else f"✅ แปลเสร็จ! {done_chunks} chunks")
+            await msg.edit_text(f"{status} — กำลังส่งไฟล์...")
+            await msg.reply_document(
+                document=io.BytesIO(combined.encode("utf-8")),
+                filename=f"{title_slug}_TH.txt",
+                caption=caption,
+            )
 
     except Exception as e:
         logger.error(f"Novel translation error: {e}")
@@ -1573,6 +1641,76 @@ async def callback_nvpronoun(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"สรรพนาม: {_pronoun_label(data)}\nส่งไฟล์ .txt มาใหม่เพื่อแปล")
 
 
+async def handle_novel_zip(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                           zip_bytes: io.BytesIO, zip_filename: str):
+    """Show novel batch preview for a ZIP containing .txt files."""
+    uid = update.effective_user.id
+    data = load_user(uid)
+
+    if not data.get("api_key"):
+        await update.message.reply_text("Set API key first: /setkey <key>")
+        return
+
+    files = []
+    total_chars = 0
+    total_chunks = 0
+
+    with zipfile.ZipFile(zip_bytes, 'r') as zf:
+        txt_names = sorted(
+            n for n in zf.namelist()
+            if n.lower().endswith('.txt') and not os.path.basename(n).startswith('.')
+        )
+        for zname in txt_names:
+            content = zf.read(zname).decode('utf-8', errors='replace').strip()
+            if not content:
+                continue
+            chunks = split_novel_text(content)
+            files.append({"name": os.path.basename(zname), "chunks": chunks})
+            total_chars += len(content)
+            total_chunks += len(chunks)
+
+    if not files:
+        await update.message.reply_text("ไม่พบไฟล์ .txt ใน ZIP หรือทุกไฟล์ว่างเปล่า")
+        return
+
+    _pending_novels[uid] = {
+        "mode": "zip",
+        "files": files,
+        "filename": zip_filename,
+        "char_count": total_chars,
+        "chunk_count": total_chunks,
+    }
+
+    file_list = "\n".join(
+        f"  • {f['name']} ({len(f['chunks'])} chunks)" for f in files[:8]
+    )
+    if len(files) > 8:
+        file_list += f"\n  ... และอีก {len(files)-8} ไฟล์"
+
+    model = data.get("model", DEFAULT_MODEL)
+    genre = data.get("genre", "ไม่ระบุ (ทั่วไป)")
+    prof = data.get("current_profile") or "None"
+    title = data.get("current_title") or "ไม่ระบุ"
+    prev_ctx = get_novel_context(data)
+    pronoun = _pronoun_label(data)
+    custom = get_custom_prompt(data)
+
+    text = (
+        f"📦 Novel ZIP mode\n"
+        f"ไฟล์: {zip_filename}\n"
+        f"{len(files)} ไฟล์ | {total_chars:,} chars | {total_chunks} chunks\n\n"
+        f"{file_list}\n\n"
+        f"Model: {model}\n"
+        f"Genre: {genre}\n"
+        f"Profile: {prof}  |  เรื่อง: {title}\n"
+        f"สรรพนาม: {pronoun}\n"
+        f"Custom prompt: {'ตั้งแล้ว ✓' if custom else 'ไม่ได้ตั้ง'}\n"
+        f"บริบทต่อเนื่อง: {'มีจากตอนที่แล้ว ✓' if prev_ctx else 'เริ่มใหม่'}\n\n"
+        f"กด Translate เพื่อเริ่มแปล"
+    )
+    await update.message.reply_text(text, reply_markup=_novel_preview_buttons(data))
+
+
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle ZIP or image files."""
     uid = update.effective_user.id
@@ -1613,6 +1751,18 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await file.download_to_memory(zip_bytes)
         zip_bytes.seek(0)
 
+        # Peek to decide: novel ZIP or image ZIP
+        with zipfile.ZipFile(zip_bytes, 'r') as zf:
+            names = zf.namelist()
+            has_txt = any(n.lower().endswith('.txt') for n in names
+                          if not os.path.basename(n).startswith('.'))
+        zip_bytes.seek(0)
+
+        if has_txt:
+            await msg.delete()
+            await handle_novel_zip(update, ctx, zip_bytes, fname)
+            return
+
         images = []
         with zipfile.ZipFile(zip_bytes, 'r') as zf:
             for name in sorted(zf.namelist()):
@@ -1624,7 +1774,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     images.append((os.path.basename(name), buf.getvalue()))
 
         if not images:
-            await msg.edit_text("No images found in ZIP")
+            await msg.edit_text("No images or .txt files found in ZIP")
             return
 
         total = len(images)
