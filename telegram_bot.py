@@ -968,6 +968,9 @@ def _novel_preview_buttons(data):
             InlineKeyboardButton("🎭 Genre", callback_data="novel:genre"),
         ],
     ]
+    if data.get("titles"):
+        title = data.get("current_title") or "เลือกชื่อเรื่อง..."
+        rows.append([InlineKeyboardButton(f"📖 {title}", callback_data="novel:title")])
     if get_novel_context(data):
         rows.append([InlineKeyboardButton("🔄 เริ่มใหม่ (ล้าง context)", callback_data="novel:fresh")])
     return InlineKeyboardMarkup(rows)
@@ -1075,6 +1078,24 @@ async def callback_novel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ]
         buttons.append([InlineKeyboardButton("<< Back", callback_data="novel:back")])
         await query.edit_message_text("เลือก Genre:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if action == "title":
+        novel_data = _pending_novels.get(uid)
+        if not novel_data:
+            await query.edit_message_text("ไม่มีไฟล์รอแปล ส่งไฟล์ .txt มาใหม่")
+            return
+        titles = data.get("titles", [])
+        if not titles:
+            await query.answer("ไม่มีชื่อเรื่อง กรุณาใช้ /addtitle ก่อน", show_alert=True)
+            return
+        current = data.get("current_title")
+        buttons = [
+            [InlineKeyboardButton(f"{'>> ' if t == current else ''}{t}", callback_data=f"nvt:{i}")]
+            for i, t in enumerate(titles)
+        ]
+        buttons.append([InlineKeyboardButton("<< Back", callback_data="novel:back")])
+        await query.edit_message_text("เลือกชื่อเรื่อง:", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     if action == "back":
@@ -1421,6 +1442,28 @@ async def callback_nvgenre(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"Genre set to: {GENRE_LIST[idx]}\nส่งไฟล์ .txt มาใหม่เพื่อแปล")
 
 
+async def callback_nvtitle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle title selection during novel translate flow."""
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    idx = int(query.data[4:])  # remove "nvt:"
+    data = load_user(uid)
+    titles = data.get("titles", [])
+    if idx < len(titles):
+        data["current_title"] = titles[idx]
+        save_user(uid, data)
+    novel_data = _pending_novels.get(uid)
+    if novel_data:
+        await query.edit_message_text(
+            _novel_preview_text(data, novel_data["filename"],
+                                novel_data["char_count"], len(novel_data["chunks"])),
+            reply_markup=_novel_preview_buttons(data),
+        )
+    else:
+        await query.edit_message_text(f"เลือกเรื่อง: {data.get('current_title')}\nส่งไฟล์ .txt มาใหม่เพื่อแปล")
+
+
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle ZIP or image files."""
     uid = update.effective_user.id
@@ -1616,6 +1659,7 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_novel, pattern="^novel:"))
     app.add_handler(CallbackQueryHandler(callback_nvmodel, pattern="^nvm:"))
     app.add_handler(CallbackQueryHandler(callback_nvgenre, pattern="^nvg:"))
+    app.add_handler(CallbackQueryHandler(callback_nvtitle, pattern="^nvt:"))
     app.add_handler(CallbackQueryHandler(callback_model, pattern="^model:"))
     app.add_handler(CallbackQueryHandler(callback_translate, pattern="^tr:"))
     app.add_handler(CallbackQueryHandler(callback_trmodel, pattern="^trm:"))
