@@ -403,18 +403,25 @@ def format_glossary_context(glossary):
 
 
 def _auto_push(data, glossary):
-    """Push glossary to sheet; return status note string."""
-    if not (SHEETS_AVAILABLE and glossary and data.get("sheet_id") and data.get("current_title")):
+    """Push glossary to sheet; return status note string (always non-empty when glossary exists)."""
+    if not glossary:
         return ""
+    if not SHEETS_AVAILABLE:
+        return ""
+    if not data.get("sheet_id"):
+        return "\n[Sheet] ยังไม่ได้ตั้งค่า sheet → /setsheet <URL>"
+    if not data.get("current_title"):
+        return "\n[Sheet] ยังไม่ได้เลือกชื่อเรื่อง → กดปุ่ม 📖 ในเมนูก่อนแปล"
     creds_path = os.path.join(DATA_DIR, "credentials.json")
     if not os.path.exists(creds_path):
-        return ""
+        return "\n[Sheet] ไม่พบ credentials.json → ตั้ง env var GOOGLE_CREDENTIALS_JSON"
     try:
         count = push_glossary_to_sheet(
             data["sheet_id"], data["current_title"], glossary,
             creds_path, data.get("sheet_name")
         )
-        return f"\n[Sheet] บันทึก {count} คำใหม่ → {data['current_title']}" if count > 0 else ""
+        return f"\n[Sheet] บันทึก {count} คำใหม่ → {data['current_title']}" if count > 0 else \
+               f"\n[Sheet] ไม่มีคำใหม่ (มีทั้งหมดแล้ว)"
     except Exception as e:
         return f"\n[Sheet] Push ล้มเหลว: {e}"
 
