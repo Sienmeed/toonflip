@@ -76,6 +76,21 @@ GENRE_PRESETS = {
 }
 GENRE_LIST = list(GENRE_PRESETS.keys())
 
+# (display_name, instruction injected into prompt)
+PRONOUN_PRESETS = [
+    ("อัตโนมัติ (ตามบริบท)", ""),
+    ("สมัยใหม่ — ฉัน/คุณ/นาย/เธอ",
+     "สรรพนาม: ใช้ ฉัน/คุณ/นาย/เธอ/แก เป็นหลักตลอดเรื่อง ห้ามใช้ ข้า/เจ้า/ท่าน"),
+    ("ทางการ — ผม/ดิฉัน/คุณ/ท่าน",
+     "สรรพนาม: ใช้ ผม/ดิฉัน/คุณ/ท่าน เป็นหลักตลอดเรื่อง"),
+    ("โบราณ/วัง — ข้า/เจ้า/ท่าน",
+     "สรรพนาม: ใช้ ข้า/เจ้า/ท่าน/พระองค์ ตามสมัยโบราณ/ราชสำนัก"),
+    ("กันเอง — กู/มึง/แก/มัน",
+     "สรรพนาม: ใช้ กู/มึง/แก/มัน สำหรับตัวละครที่พูดกันเอง"),
+    ("กำลังภายใน — ข้า/ท่าน/พวกเจ้า",
+     "สรรพนาม: ใช้ ข้า/ท่าน/พวกเจ้า/อาจารย์ แบบนิยายกำลังภายใน"),
+]
+
 PROMPT_SINGLE = """คุณเป็นผู้เชี่ยวชาญแปลมังงะ/มันฮวาเป็นไทย (ตรวจจับภาษาอัตโนมัติ)
 งาน: 1.OCR ข้อความจากภาพ ตามลำดับ panel บนลงล่าง 2.แปลเป็นไทย 3.สร้าง Glossary
 กฎ: แปลตาม panel บนลงล่าง, ภาษาไทยธรรมชาติ, ทับศัพท์ชื่อเฉพาะ, SFX แปลเป็นไทย, คั่น speech bubble ด้วยบรรทัดว่าง
@@ -270,6 +285,17 @@ def set_custom_prompt(user_data, prompt):
     if prof and prof in user_data.get("profiles", {}):
         user_data["profiles"][prof]["custom_prompt"] = prompt
 
+def get_pronoun_style(user_data):
+    prof = user_data.get("current_profile")
+    if prof and prof in user_data.get("profiles", {}):
+        return user_data["profiles"][prof].get("pronoun_style", "")
+    return ""
+
+def set_pronoun_style(user_data, style):
+    prof = user_data.get("current_profile")
+    if prof and prof in user_data.get("profiles", {}):
+        user_data["profiles"][prof]["pronoun_style"] = style
+
 def get_novel_context(user_data):
     """Get rolling context (tail of last translated output) for continuity."""
     prof = user_data.get("current_profile")
@@ -303,7 +329,7 @@ def split_novel_text(text, max_chars=NOVEL_CHUNK_SIZE):
 
 
 def translate_novel_chunk(text, api_key, model_name, genre_ctx, glossary,
-                           custom_ctx="", prev_context="", chunk_num=1):
+                           custom_ctx="", prev_context="", chunk_num=1, pronoun_ctx=""):
     """Translate a novel text chunk with rolling context for continuity."""
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
@@ -323,6 +349,8 @@ def translate_novel_chunk(text, api_key, model_name, genre_ctx, glossary,
                               .replace("{{genre_info}}", genre_info) \
                               .replace("{{glossary_lines}}", glossary_lines)
 
+    if pronoun_ctx:
+        sys_prompt += f"\n\n[กำกับสรรพนาม — บังคับใช้ตลอดการแปล]\n{pronoun_ctx}"
     if custom_ctx:
         sys_prompt += f"\n\n[คำแนะนำพิเศษสำหรับเรื่องนี้]\n{custom_ctx}"
 
@@ -374,6 +402,15 @@ def format_glossary_context(glossary):
     return "\n".join(lines)
 
 
+def _pronoun_label(user_data):
+    """Return display name of current pronoun preset."""
+    style = get_pronoun_style(user_data)
+    for name, instruction in PRONOUN_PRESETS:
+        if instruction == style:
+            return name
+    return "อัตโนมัติ (ตามบริบท)"
+
+
 def _settings_text(data):
     model = data.get("model", DEFAULT_MODEL)
     genre = data.get("genre", "ไม่ระบุ (ทั่วไป)")
@@ -389,6 +426,10 @@ def _settings_text(data):
     if data.get("titles"):
         title = data.get("current_title") or "ยังไม่เลือก"
         lines.append(f"เรื่อง: {title}")
+    if data.get("current_profile"):
+        pronoun = _pronoun_label(data)
+        if pronoun != "อัตโนมัติ (ตามบริบท)":
+            lines.append(f"สรรพนาม: {pronoun}")
     if custom:
         lines.append(f"Custom prompt: {len(custom)} chars")
     lines.append("\nแก้ settings หรือกด Translate เลย")
@@ -407,8 +448,10 @@ def _settings_buttons(data):
         title = data.get("current_title") or "เลือกชื่อเรื่อง..."
         rows.append([InlineKeyboardButton(f"📖 {title}", callback_data="tr:title")])
     if data.get("current_profile"):
+        pronoun = _pronoun_label(data)
+        rows.append([InlineKeyboardButton(f"💬 {pronoun}", callback_data="tr:pronouns")])
         custom = get_custom_prompt(data)
-        label = f"✏️ Prompt (set)" if custom else "✏️ Prompt"
+        label = "✏️ Prompt (set)" if custom else "✏️ Prompt"
         rows.append([InlineKeyboardButton(label, callback_data="tr:prompt")])
     return InlineKeyboardMarkup(rows)
 
@@ -416,7 +459,8 @@ def _settings_buttons(data):
 # ============================================================
 # GEMINI TRANSLATION
 # ============================================================
-def translate_image_bytes(img_bytes, api_key, model_name, genre_ctx, glossary_ctx, custom_ctx=""):
+def translate_image_bytes(img_bytes, api_key, model_name, genre_ctx, glossary_ctx,
+                          custom_ctx="", pronoun_ctx=""):
     """Translate image bytes. Returns (text, glossary_section)."""
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
@@ -424,6 +468,8 @@ def translate_image_bytes(img_bytes, api_key, model_name, genre_ctx, glossary_ct
     sys_prompt = PROMPT_SINGLE
     if genre_ctx:
         sys_prompt += "\n\n" + genre_ctx
+    if pronoun_ctx:
+        sys_prompt += "\n\n[กำกับสรรพนาม]\n" + pronoun_ctx
     if custom_ctx:
         sys_prompt += "\n\n[คำแนะนำพิเศษสำหรับเรื่องนี้]\n" + custom_ctx
     parts = []
@@ -947,6 +993,7 @@ def _novel_preview_text(data, filename, char_count, chunk_count):
     title = data.get("current_title") or "ไม่ระบุ"
     prev_ctx = get_novel_context(data)
     custom = get_custom_prompt(data)
+    pronoun = _pronoun_label(data)
     return (
         f"📖 Novel mode\n"
         f"ไฟล์: {filename}\n"
@@ -954,6 +1001,7 @@ def _novel_preview_text(data, filename, char_count, chunk_count):
         f"Model: {model}\n"
         f"Genre: {genre}\n"
         f"Profile: {prof}  |  เรื่อง: {title}\n"
+        f"สรรพนาม: {pronoun}\n"
         f"Custom prompt: {'ตั้งแล้ว ✓' if custom else 'ไม่ได้ตั้ง'}\n"
         f"บริบทต่อเนื่อง: {'มีจากตอนที่แล้ว ✓' if prev_ctx else 'เริ่มใหม่'}\n\n"
         f"กด Translate เพื่อเริ่มแปล"
@@ -967,6 +1015,7 @@ def _novel_preview_buttons(data):
             InlineKeyboardButton("🤖 Model", callback_data="novel:model"),
             InlineKeyboardButton("🎭 Genre", callback_data="novel:genre"),
         ],
+        [InlineKeyboardButton(f"💬 {_pronoun_label(data)}", callback_data="novel:pronouns")],
     ]
     if data.get("titles"):
         title = data.get("current_title") or "เลือกชื่อเรื่อง..."
@@ -1098,6 +1147,17 @@ async def callback_novel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("เลือกชื่อเรื่อง:", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
+    if action == "pronouns":
+        current = get_pronoun_style(data)
+        buttons = [
+            [InlineKeyboardButton(f"{'>> ' if instr == current else ''}{name}",
+                                  callback_data=f"nvpr:{i}")]
+            for i, (name, instr) in enumerate(PRONOUN_PRESETS)
+        ]
+        buttons.append([InlineKeyboardButton("<< Back", callback_data="novel:back")])
+        await query.edit_message_text("เลือกสรรพนาม:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
     if action == "back":
         novel_data = _pending_novels.get(uid)
         if not novel_data:
@@ -1135,6 +1195,7 @@ async def callback_novel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     genre_ctx = GENRE_PRESETS.get(data.get("genre", "ไม่ระบุ (ทั่วไป)"), "")
     glossary = get_glossary(data)
     custom_ctx = get_custom_prompt(data)
+    pronoun_ctx = get_pronoun_style(data)
     prev_context = get_novel_context(data)
     _stop_novel.discard(uid)
 
@@ -1154,7 +1215,7 @@ async def callback_novel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             translated, gloss_section = translate_novel_chunk(
                 chunk, api_key, model_name, genre_ctx, glossary,
-                custom_ctx, prev_context, chunk_num=i+1
+                custom_ctx, prev_context, chunk_num=i+1, pronoun_ctx=pronoun_ctx
             )
             if gloss_section:
                 glossary = parse_glossary(gloss_section, glossary)
@@ -1244,9 +1305,10 @@ async def callback_translate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             glossary = get_glossary(data)
             glossary_ctx = format_glossary_context(glossary)
             custom_ctx = get_custom_prompt(data)
+            pronoun_ctx = get_pronoun_style(data)
 
             translated, gloss_section = translate_image_bytes(
-                img_data, api_key, model_name, genre_ctx, glossary_ctx, custom_ctx
+                img_data, api_key, model_name, genre_ctx, glossary_ctx, custom_ctx, pronoun_ctx
             )
 
             if gloss_section:
@@ -1354,6 +1416,19 @@ async def callback_translate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_user(uid, data)
         await query.edit_message_text(_settings_text(data), reply_markup=_settings_buttons(data))
 
+    elif action == "pronouns":
+        if not data.get("current_profile"):
+            await query.answer("เลือก profile ก่อน", show_alert=True)
+            return
+        current = get_pronoun_style(data)
+        buttons = [
+            [InlineKeyboardButton(f"{'>> ' if instr == current else ''}{name}",
+                                  callback_data=f"trpr:{i}")]
+            for i, (name, instr) in enumerate(PRONOUN_PRESETS)
+        ]
+        buttons.append([InlineKeyboardButton("<< Back", callback_data="tr:back")])
+        await query.edit_message_text("เลือกสรรพนาม:", reply_markup=InlineKeyboardMarkup(buttons))
+
     elif action == "back":
         await query.edit_message_text(_settings_text(data), reply_markup=_settings_buttons(data))
 
@@ -1396,6 +1471,19 @@ async def callback_trtitle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if idx < len(titles):
         data["current_title"] = titles[idx]
         save_user(uid, data)
+    await query.edit_message_text(_settings_text(data), reply_markup=_settings_buttons(data))
+
+
+async def callback_trpronoun(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle pronoun preset selection during image translate flow."""
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    idx = int(query.data[5:])  # remove "trpr:"
+    data = load_user(uid)
+    _, instruction = PRONOUN_PRESETS[idx]
+    set_pronoun_style(data, instruction)
+    save_user(uid, data)
     await query.edit_message_text(_settings_text(data), reply_markup=_settings_buttons(data))
 
 
@@ -1464,6 +1552,27 @@ async def callback_nvtitle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"เลือกเรื่อง: {data.get('current_title')}\nส่งไฟล์ .txt มาใหม่เพื่อแปล")
 
 
+async def callback_nvpronoun(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle pronoun preset selection during novel translate flow."""
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    idx = int(query.data[5:])  # remove "nvpr:"
+    data = load_user(uid)
+    _, instruction = PRONOUN_PRESETS[idx]
+    set_pronoun_style(data, instruction)
+    save_user(uid, data)
+    novel_data = _pending_novels.get(uid)
+    if novel_data:
+        await query.edit_message_text(
+            _novel_preview_text(data, novel_data["filename"],
+                                novel_data["char_count"], len(novel_data["chunks"])),
+            reply_markup=_novel_preview_buttons(data),
+        )
+    else:
+        await query.edit_message_text(f"สรรพนาม: {_pronoun_label(data)}\nส่งไฟล์ .txt มาใหม่เพื่อแปล")
+
+
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle ZIP or image files."""
     uid = update.effective_user.id
@@ -1527,6 +1636,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         genre_ctx = GENRE_PRESETS.get(genre_name, "")
         glossary = get_glossary(data)
         custom_ctx = get_custom_prompt(data)
+        pronoun_ctx = get_pronoun_style(data)
 
         all_pages = []
         for i, (fname, img_data) in enumerate(images):
@@ -1535,7 +1645,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             glossary_ctx = format_glossary_context(glossary)
             translated, gloss_section = translate_image_bytes(
-                img_data, api_key, model_name, genre_ctx, glossary_ctx, custom_ctx
+                img_data, api_key, model_name, genre_ctx, glossary_ctx, custom_ctx, pronoun_ctx
             )
 
             if gloss_section:
@@ -1660,11 +1770,13 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_nvmodel, pattern="^nvm:"))
     app.add_handler(CallbackQueryHandler(callback_nvgenre, pattern="^nvg:"))
     app.add_handler(CallbackQueryHandler(callback_nvtitle, pattern="^nvt:"))
+    app.add_handler(CallbackQueryHandler(callback_nvpronoun, pattern="^nvpr:"))
     app.add_handler(CallbackQueryHandler(callback_model, pattern="^model:"))
     app.add_handler(CallbackQueryHandler(callback_translate, pattern="^tr:"))
     app.add_handler(CallbackQueryHandler(callback_trmodel, pattern="^trm:"))
     app.add_handler(CallbackQueryHandler(callback_trgenre, pattern="^trg:"))
     app.add_handler(CallbackQueryHandler(callback_trtitle, pattern="^trt:"))
+    app.add_handler(CallbackQueryHandler(callback_trpronoun, pattern="^trpr:"))
     app.add_handler(CallbackQueryHandler(callback_tts, pattern="^tts:"))
 
     app.add_handler(MessageHandler(filters.PHOTO, handle_image))
