@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+bot_data/
+credentials.json
+.env
