@@ -289,12 +289,14 @@ def get_pronoun_style(user_data):
     prof = user_data.get("current_profile")
     if prof and prof in user_data.get("profiles", {}):
         return user_data["profiles"][prof].get("pronoun_style", "")
-    return ""
+    return user_data.get("pronoun_style", "")
 
 def set_pronoun_style(user_data, style):
     prof = user_data.get("current_profile")
     if prof and prof in user_data.get("profiles", {}):
         user_data["profiles"][prof]["pronoun_style"] = style
+    else:
+        user_data["pronoun_style"] = style
 
 def get_novel_context(user_data):
     """Get rolling context (tail of last translated output) for continuity."""
